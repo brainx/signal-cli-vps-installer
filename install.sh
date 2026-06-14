@@ -764,12 +764,18 @@ expected_sha256_from_checksum_file() {
       sub(/^\*/, "", name)
       n = split(name, parts, "/")
       base = parts[n]
-      if (base == asset && $1 ~ /^[A-Fa-f0-9]{64}$/) {
+      if (base == asset) {
         print $1
         exit
       }
     }
   ' "$checksum_file"
+}
+
+validate_checksum_file_digest() {
+  local digest="$1"
+
+  [[ "$digest" =~ ^[A-Fa-f0-9]{64}$ ]] || die "Checksum entry for $SIGNAL_CLI_ASSET in $CHECKSUM_URL is not a valid SHA256 digest."
 }
 
 verify_signal_cli_artifact() {
@@ -792,6 +798,7 @@ verify_signal_cli_artifact() {
         download_checksum_file "$checksum_file"
         expected="$(expected_sha256_from_checksum_file "$checksum_file" "$SIGNAL_CLI_ASSET")"
         [[ -n "$expected" ]] || die "No checksum entry for $SIGNAL_CLI_ASSET in $CHECKSUM_URL."
+        validate_checksum_file_digest "$expected"
         verify_sha256 "$SIGNAL_CLI_ARTIFACT" "$expected"
         return 0
       fi
@@ -805,6 +812,7 @@ verify_signal_cli_artifact() {
         download_checksum_file "$checksum_file"
         expected="$(expected_sha256_from_checksum_file "$checksum_file" "$SIGNAL_CLI_ASSET")"
         [[ -n "$expected" ]] || die "No checksum entry for $SIGNAL_CLI_ASSET in $CHECKSUM_URL."
+        validate_checksum_file_digest "$expected"
         verify_sha256 "$SIGNAL_CLI_ARTIFACT" "$expected"
       elif is_true "$ALLOW_UNVERIFIED_DOWNLOAD"; then
         warn "No checksum material provided. Continuing because --allow-unverified-download was set."

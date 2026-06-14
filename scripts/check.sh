@@ -14,7 +14,7 @@ bash -n tests/run-tests.sh
 
 if command -v shellcheck >/dev/null 2>&1; then
   echo "[check] shellcheck"
-  shellcheck install.sh scripts/check.sh scripts/uninstall.sh scripts/upgrade-signal-cli.sh scripts/rollback-signal-cli.sh tests/run-tests.sh
+  shellcheck -x install.sh scripts/check.sh scripts/uninstall.sh scripts/upgrade-signal-cli.sh scripts/rollback-signal-cli.sh tests/run-tests.sh
 else
   echo "[check] shellcheck not installed; skipping"
 fi

@@ -69,19 +69,11 @@ main_upgrade() {
   trap cleanup EXIT
 
   parse_upgrade_args "$@"
-  RUN_LINK="false"
-  SSH_HARDENING="false"
-  ENABLE_UFW="false"
-  ENABLE_FAIL2BAN="false"
-  ENABLE_SYSCTL_HARDENING="false"
-  ENABLE_UNATTENDED_UPGRADES="false"
-
   parse_args "${INSTALL_ARGS[@]}"
   require_root "${INSTALL_ARGS[@]}"
   validate_inputs
   choose_install_mode
   preflight_checks
-  build_base_packages
   install_bootstrap_packages
   resolve_signal_cli_version
   build_signal_cli_asset_url

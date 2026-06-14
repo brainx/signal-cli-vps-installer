@@ -335,7 +335,7 @@ validate_inputs() {
     DEVICE_NAME="$(hostname -s 2>/dev/null || hostname)-signal-cli"
   fi
 
-  if [[ -r /dev/tty && ! is_dry_run ]]; then
+  if [[ -r /dev/tty ]] && ! is_dry_run; then
     if [[ -z "$SIGNAL_ACCOUNT" ]]; then
       read -r -p "Signal account number, e.g. +31612345678. Leave blank for multi-account mode: " SIGNAL_ACCOUNT < /dev/tty || true
     fi

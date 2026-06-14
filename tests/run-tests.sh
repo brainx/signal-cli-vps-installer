@@ -265,7 +265,8 @@ expect_success "systemd unit verifies when systemd-analyze exists" bash -c '
   set -Eeuo pipefail
   cd "$1"
   source ./install.sh
-  rendered="$(mktemp)"
+  work_dir="$(mktemp -d)"
+  rendered="$work_dir/signal-cli.service"
   render_systemd_service > "$rendered"
   if command -v systemd-analyze >/dev/null 2>&1; then
     systemd-analyze verify "$rendered"

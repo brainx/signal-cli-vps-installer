@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck source=../install.sh
+# shellcheck source=install.sh
 source "$ROOT_DIR/install.sh"
 
 UPGRADE_NO_RESTART="${UPGRADE_NO_RESTART:-false}"

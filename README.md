@@ -86,6 +86,8 @@ curl -i http://127.0.0.1:8080/api/v1/check
 
 Run `./install.sh --help` for the full option list.
 
+Upgrade and rollback scripts are binary-only lifecycle tools. They do not prompt for Signal account details, do not relink devices, and do not modify `/var/lib/signal-cli`.
+
 ## Install Modes
 
 | Mode | Behavior |

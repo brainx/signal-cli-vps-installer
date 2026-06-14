@@ -93,6 +93,7 @@ sudo systemctl restart signal-cli
 ## Upgrade signal-cli
 
 Upgrade only changes the installed binary and symlink. It does not relink the Signal device or remove `/var/lib/signal-cli`.
+The upgrade script is non-interactive apart from sudo/root escalation. It does not ask for the Signal account number, does not relink a device, and does not modify `/var/lib/signal-cli`.
 
 Preview:
 
@@ -115,6 +116,7 @@ sudo scripts/upgrade-signal-cli.sh --version 0.14.6 --install-mode native --sha2
 ## Roll Back signal-cli
 
 Rollback switches `/usr/local/bin/signal-cli` back to an existing version under `/opt` and restarts the service. It does not delete any installed versions.
+Rollback only switches the `/usr/local/bin/signal-cli` symlink to an already-installed version under `/opt`.
 
 Preview:
 

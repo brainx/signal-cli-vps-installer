@@ -48,6 +48,7 @@ Before tagging a release:
 - publish or link checksum material for release artifacts;
 - test `scripts/upgrade-signal-cli.sh --dry-run`;
 - test `scripts/rollback-signal-cli.sh --dry-run`;
+- confirm upgrade and rollback scripts are non-interactive in dry-run and `TEST_MODE`;
 - confirm compatibility claims match CI coverage.
 
 Read the installer end to end before the first public commit:

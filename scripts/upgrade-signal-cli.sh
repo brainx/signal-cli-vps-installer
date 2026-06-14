@@ -64,14 +64,25 @@ Upgrade plan:
 EOF
 }
 
+validate_upgrade_inputs() {
+  # Upgrade is binary-only. It must not prompt for account, device,
+  # bind, or SSH hardening choices.
+  RUN_LINK="false"
+  SSH_HARDENING="false"
+  SIGNAL_ACCOUNT="${SIGNAL_ACCOUNT:-}"
+  validate_common_release_inputs
+}
+
 main_upgrade() {
   trap on_error ERR
   trap cleanup EXIT
 
   parse_upgrade_args "$@"
   parse_args "${INSTALL_ARGS[@]}"
+  RUN_LINK="false"
+  SSH_HARDENING="false"
   require_root "${INSTALL_ARGS[@]}"
-  validate_inputs
+  validate_upgrade_inputs
   choose_install_mode
   preflight_checks
   install_bootstrap_packages

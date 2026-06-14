@@ -444,27 +444,7 @@ validate_device_name() {
   [[ ! "$DEVICE_NAME" =~ [[:cntrl:]] ]] || die "Device name cannot contain control characters."
 }
 
-validate_inputs() {
-  if [[ -z "$DEVICE_NAME" ]]; then
-    DEVICE_NAME="$(hostname -s 2>/dev/null || hostname)-signal-cli"
-  fi
-
-  if [[ -r /dev/tty ]] && ! is_dry_run && ! is_true "$TEST_MODE"; then
-    if [[ -z "$SIGNAL_ACCOUNT" ]]; then
-      read -r -p "Signal account number, e.g. +31612345678. Leave blank for multi-account mode: " SIGNAL_ACCOUNT </dev/tty || true
-    fi
-
-    local input_device=""
-    read -r -p "Linked device name [$DEVICE_NAME]: " input_device </dev/tty || true
-    DEVICE_NAME="${input_device:-$DEVICE_NAME}"
-  fi
-
-  validate_device_name
-
-  if [[ -n "$SIGNAL_ACCOUNT" && ! "$SIGNAL_ACCOUNT" =~ ^\+[1-9][0-9]{6,14}$ ]]; then
-    die "Invalid --account. Use international E.164 format, for example +31612345678."
-  fi
-
+validate_common_release_inputs() {
   if [[ ! "$INSTALL_MODE" =~ ^(auto|native|jvm)$ ]]; then
     die "Invalid install mode: $INSTALL_MODE"
   fi
@@ -489,6 +469,30 @@ validate_inputs() {
     [[ "$ARTIFACT_FILE" != http://* && "$ARTIFACT_FILE" != https://* ]] || die "--artifact-file must be a local file path."
     [[ -f "$ARTIFACT_FILE" ]] || die "--artifact-file does not exist: $ARTIFACT_FILE"
   fi
+}
+
+validate_inputs() {
+  if [[ -z "$DEVICE_NAME" ]]; then
+    DEVICE_NAME="$(hostname -s 2>/dev/null || hostname)-signal-cli"
+  fi
+
+  if [[ -r /dev/tty ]] && ! is_dry_run && ! is_true "$TEST_MODE"; then
+    if [[ -z "$SIGNAL_ACCOUNT" ]]; then
+      read -r -p "Signal account number, e.g. +31612345678. Leave blank for multi-account mode: " SIGNAL_ACCOUNT </dev/tty || true
+    fi
+
+    local input_device=""
+    read -r -p "Linked device name [$DEVICE_NAME]: " input_device </dev/tty || true
+    DEVICE_NAME="${input_device:-$DEVICE_NAME}"
+  fi
+
+  validate_device_name
+
+  if [[ -n "$SIGNAL_ACCOUNT" && ! "$SIGNAL_ACCOUNT" =~ ^\+[1-9][0-9]{6,14}$ ]]; then
+    die "Invalid --account. Use international E.164 format, for example +31612345678."
+  fi
+
+  validate_common_release_inputs
 
   if [[ "$SSH_HARDENING" == "ask" ]]; then
     if is_dry_run; then
@@ -1138,6 +1142,11 @@ link_signal_device() {
   is_true "$RUN_LINK" || return 0
   set_stage "device linking"
 
+  if is_true "$TEST_MODE"; then
+    printf '[test-mode] skip Signal device linking\n'
+    return 0
+  fi
+
   if is_dry_run; then
     printf '[dry-run] link Signal device as %s with device name %s\n' "$SERVICE_USER" "$DEVICE_NAME"
     return 0
@@ -1169,6 +1178,12 @@ EOF
 
 run_initial_receive() {
   set_stage "initial receive"
+
+  if is_true "$TEST_MODE"; then
+    printf '[test-mode] skip initial receive\n'
+    return 0
+  fi
+
   if [[ -z "$SIGNAL_ACCOUNT" ]]; then
     warn "No account number configured. Service will run in multi-account mode. JSON-RPC calls must include the account parameter."
     return 0

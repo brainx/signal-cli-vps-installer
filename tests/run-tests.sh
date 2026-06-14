@@ -60,7 +60,7 @@ expect_output_contains() {
   shift 2
   : >"$TMP_DIR/stdout"
   : >"$TMP_DIR/stderr"
-  if "$@" >"$TMP_DIR/stdout" 2>"$TMP_DIR/stderr" && grep -Fq "$needle" "$TMP_DIR/stdout"; then
+  if "$@" >"$TMP_DIR/stdout" 2>"$TMP_DIR/stderr" && { grep -Fq "$needle" "$TMP_DIR/stdout" || grep -Fq "$needle" "$TMP_DIR/stderr"; }; then
     pass "$name"
   else
     fail "$name"
@@ -73,7 +73,20 @@ expect_output_not_contains() {
   shift 2
   : >"$TMP_DIR/stdout"
   : >"$TMP_DIR/stderr"
-  if "$@" >"$TMP_DIR/stdout" 2>"$TMP_DIR/stderr" && ! grep -Fxq "$needle" "$TMP_DIR/stdout"; then
+  if "$@" >"$TMP_DIR/stdout" 2>"$TMP_DIR/stderr" && ! grep -Fxq "$needle" "$TMP_DIR/stdout" && ! grep -Fxq "$needle" "$TMP_DIR/stderr"; then
+    pass "$name"
+  else
+    fail "$name"
+  fi
+}
+
+expect_output_not_contains_text() {
+  local name="$1"
+  local needle="$2"
+  shift 2
+  : >"$TMP_DIR/stdout"
+  : >"$TMP_DIR/stderr"
+  if "$@" >"$TMP_DIR/stdout" 2>"$TMP_DIR/stderr" && ! grep -Fq "$needle" "$TMP_DIR/stdout" && ! grep -Fq "$needle" "$TMP_DIR/stderr"; then
     pass "$name"
   else
     fail "$name"
@@ -122,6 +135,9 @@ expect_failure "native mode fails on non-x86 arch" env TEST_UNAME_M=aarch64 "$IN
 expect_success "uninstall dry-run preserves data by default" "$ROOT_DIR/scripts/uninstall.sh" --dry-run
 expect_success "uninstall purge-data dry-run does not prompt" "$ROOT_DIR/scripts/uninstall.sh" --dry-run --purge-data
 expect_success "upgrade dry-run works" env TEST_UNAME_M=x86_64 "$ROOT_DIR/scripts/upgrade-signal-cli.sh" --dry-run --version 0.0.0 --install-mode native --sha256 0000000000000000000000000000000000000000000000000000000000000000
+expect_output_not_contains_text "upgrade dry-run does not prompt for Signal account" "Signal account number" env TEST_UNAME_M=x86_64 "$ROOT_DIR/scripts/upgrade-signal-cli.sh" --dry-run --version 0.0.0 --install-mode native --sha256 0000000000000000000000000000000000000000000000000000000000000000
+expect_output_not_contains_text "upgrade dry-run does not prompt for linked device name" "Linked device name" env TEST_UNAME_M=x86_64 "$ROOT_DIR/scripts/upgrade-signal-cli.sh" --dry-run --version 0.0.0 --install-mode native --sha256 0000000000000000000000000000000000000000000000000000000000000000
+expect_output_not_contains_text "upgrade dry-run does not ask SSH hardening" "Disable SSH password login" env TEST_UNAME_M=x86_64 "$ROOT_DIR/scripts/upgrade-signal-cli.sh" --dry-run --version 0.0.0 --install-mode native --sha256 0000000000000000000000000000000000000000000000000000000000000000
 expect_success "rollback dry-run works" "$ROOT_DIR/scripts/rollback-signal-cli.sh" --dry-run --to-version 0.0.0 --install-mode native
 
 expect_success "fixture native install writes binary and symlink" bash -c '
@@ -170,7 +186,7 @@ expect_success "fixture jvm install writes launcher and symlink" bash -c '
   test -f "$root/etc/systemd/system/signal-cli.service"
 ' bash "$ROOT_DIR" "$JVM_FIXTURE_ARCHIVE" "$(file_sha256 "$JVM_FIXTURE_ARCHIVE")"
 
-expect_success "fixture upgrade installs new binary without service restart" bash -c '
+expect_success "fixture upgrade is binary-only and non-interactive" bash -c '
   set -Eeuo pipefail
   cd "$1"
   root="$(mktemp -d)"
@@ -184,6 +200,44 @@ expect_success "fixture upgrade installs new binary without service restart" bas
     --sha256 "$digest" >/dev/null
   test -x "$root/opt/signal-cli-native-0.0.0/signal-cli"
   test -L "$root/usr/local/bin/signal-cli"
+' bash "$ROOT_DIR" "$NATIVE_FIXTURE_ARCHIVE" "$(file_sha256 "$NATIVE_FIXTURE_ARCHIVE")"
+
+expect_output_contains "test-mode skips Signal linking" "[test-mode] skip Signal device linking" bash -c '
+  set -Eeuo pipefail
+  cd "$1"
+  root="$(mktemp -d)"
+  artifact="$2"
+  digest="$3"
+  TEST_MODE=true TEST_UNAME_M=x86_64 INSTALL_ROOT="$root" ./install.sh \
+    --account +31612345678 \
+    --no-ufw \
+    --no-fail2ban \
+    --no-sysctl-hardening \
+    --no-unattended-upgrades \
+    --no-ssh-hardening \
+    --install-mode native \
+    --version 0.0.0 \
+    --artifact-file "$artifact" \
+    --sha256 "$digest"
+' bash "$ROOT_DIR" "$NATIVE_FIXTURE_ARCHIVE" "$(file_sha256 "$NATIVE_FIXTURE_ARCHIVE")"
+
+expect_output_contains "test-mode skips initial receive" "[test-mode] skip initial receive" bash -c '
+  set -Eeuo pipefail
+  cd "$1"
+  root="$(mktemp -d)"
+  artifact="$2"
+  digest="$3"
+  TEST_MODE=true TEST_UNAME_M=x86_64 INSTALL_ROOT="$root" ./install.sh \
+    --account +31612345678 \
+    --no-ufw \
+    --no-fail2ban \
+    --no-sysctl-hardening \
+    --no-unattended-upgrades \
+    --no-ssh-hardening \
+    --install-mode native \
+    --version 0.0.0 \
+    --artifact-file "$artifact" \
+    --sha256 "$digest"
 ' bash "$ROOT_DIR" "$NATIVE_FIXTURE_ARCHIVE" "$(file_sha256 "$NATIVE_FIXTURE_ARCHIVE")"
 
 expect_success "fixture rollback switches symlink" bash -c '

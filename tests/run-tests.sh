@@ -33,9 +33,9 @@ fail() {
 expect_success() {
   local name="$1"
   shift
-  : > "$TMP_DIR/stdout"
-  : > "$TMP_DIR/stderr"
-  if "$@" > "$TMP_DIR/stdout" 2> "$TMP_DIR/stderr"; then
+  : >"$TMP_DIR/stdout"
+  : >"$TMP_DIR/stderr"
+  if "$@" >"$TMP_DIR/stdout" 2>"$TMP_DIR/stderr"; then
     pass "$name"
   else
     fail "$name"
@@ -45,9 +45,9 @@ expect_success() {
 expect_failure() {
   local name="$1"
   shift
-  : > "$TMP_DIR/stdout"
-  : > "$TMP_DIR/stderr"
-  if "$@" > "$TMP_DIR/stdout" 2> "$TMP_DIR/stderr"; then
+  : >"$TMP_DIR/stdout"
+  : >"$TMP_DIR/stderr"
+  if "$@" >"$TMP_DIR/stdout" 2>"$TMP_DIR/stderr"; then
     fail "$name"
   else
     pass "$name"
@@ -58,9 +58,9 @@ expect_output_contains() {
   local name="$1"
   local needle="$2"
   shift 2
-  : > "$TMP_DIR/stdout"
-  : > "$TMP_DIR/stderr"
-  if "$@" > "$TMP_DIR/stdout" 2> "$TMP_DIR/stderr" && grep -Fq "$needle" "$TMP_DIR/stdout"; then
+  : >"$TMP_DIR/stdout"
+  : >"$TMP_DIR/stderr"
+  if "$@" >"$TMP_DIR/stdout" 2>"$TMP_DIR/stderr" && grep -Fq "$needle" "$TMP_DIR/stdout"; then
     pass "$name"
   else
     fail "$name"
@@ -71,9 +71,9 @@ expect_output_not_contains() {
   local name="$1"
   local needle="$2"
   shift 2
-  : > "$TMP_DIR/stdout"
-  : > "$TMP_DIR/stderr"
-  if "$@" > "$TMP_DIR/stdout" 2> "$TMP_DIR/stderr" && ! grep -Fxq "$needle" "$TMP_DIR/stdout"; then
+  : >"$TMP_DIR/stdout"
+  : >"$TMP_DIR/stderr"
+  if "$@" >"$TMP_DIR/stdout" 2>"$TMP_DIR/stderr" && ! grep -Fxq "$needle" "$TMP_DIR/stdout"; then
     pass "$name"
   else
     fail "$name"

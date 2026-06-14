@@ -19,7 +19,10 @@ ASSUME_YES="false"
 
 log() { printf '\n[+] %s\n' "$*"; }
 warn() { printf '\n[!] %s\n' "$*" >&2; }
-die() { printf '\n[ERROR] %s\n' "$*" >&2; exit 1; }
+die() {
+  printf '\n[ERROR] %s\n' "$*" >&2
+  exit 1
+}
 
 usage() {
   cat <<EOF
@@ -107,8 +110,8 @@ confirm_purge_data() {
   fi
 
   local answer
-  printf 'This will permanently remove linked-device state in %s.\n' "$DATA_DIR" > /dev/tty
-  read -r -p 'Type "remove signal-cli data" to continue: ' answer < /dev/tty || true
+  printf 'This will permanently remove linked-device state in %s.\n' "$DATA_DIR" >/dev/tty
+  read -r -p 'Type "remove signal-cli data" to continue: ' answer </dev/tty || true
   [[ "$answer" == "remove signal-cli data" ]] || die "Data purge confirmation did not match."
 }
 

@@ -43,7 +43,10 @@ CURRENT_STAGE="startup"
 
 log() { printf '\n[+] %s\n' "$*"; }
 warn() { printf '\n[!] %s\n' "$*" >&2; }
-die() { printf '\n[ERROR] %s\n' "$*" >&2; exit 1; }
+die() {
+  printf '\n[ERROR] %s\n' "$*" >&2
+  exit 1
+}
 
 usage() {
   cat <<EOF
@@ -134,7 +137,7 @@ write_rendered_file() {
   if is_dry_run; then
     printf '[dry-run] write %s\n' "$target"
   else
-    "$@" > "$target"
+    "$@" >"$target"
   fi
 }
 
@@ -155,7 +158,7 @@ ask_yes_no() {
   fi
 
   while true; do
-    read -r -p "$prompt [$label]: " answer < /dev/tty || true
+    read -r -p "$prompt [$label]: " answer </dev/tty || true
     answer="${answer:-$default}"
     case "${answer,,}" in
       y | yes) return 0 ;;
@@ -337,11 +340,11 @@ validate_inputs() {
 
   if [[ -r /dev/tty ]] && ! is_dry_run; then
     if [[ -z "$SIGNAL_ACCOUNT" ]]; then
-      read -r -p "Signal account number, e.g. +31612345678. Leave blank for multi-account mode: " SIGNAL_ACCOUNT < /dev/tty || true
+      read -r -p "Signal account number, e.g. +31612345678. Leave blank for multi-account mode: " SIGNAL_ACCOUNT </dev/tty || true
     fi
 
     local input_device=""
-    read -r -p "Linked device name [$DEVICE_NAME]: " input_device < /dev/tty || true
+    read -r -p "Linked device name [$DEVICE_NAME]: " input_device </dev/tty || true
     DEVICE_NAME="${input_device:-$DEVICE_NAME}"
   fi
 
@@ -760,7 +763,10 @@ configure_fail2ban() {
   if [[ "${#ports[@]}" -eq 0 ]]; then
     ports=(22)
   fi
-  ports_csv="$(IFS=,; printf '%s' "${ports[*]}")"
+  ports_csv="$(
+    IFS=,
+    printf '%s' "${ports[*]}"
+  )"
 
   log "Configuring fail2ban for SSH."
   run_cmd install -d -m 0755 /etc/fail2ban/jail.d
@@ -952,8 +958,8 @@ A PNG copy is also written to: $qr_file
 EOF
 
   runuser -u "$SERVICE_USER" -- env HOME="$DATA_DIR" XDG_DATA_HOME="$DATA_DIR" \
-    /usr/local/bin/signal-cli --data-dir "$DATA_DIR" link -n "$DEVICE_NAME" \
-    | tee >(xargs -r -L 1 qrencode -t utf8) >(xargs -r -L 1 qrencode -o "$qr_file" --level=H)
+    /usr/local/bin/signal-cli --data-dir "$DATA_DIR" link -n "$DEVICE_NAME" |
+    tee >(xargs -r -L 1 qrencode -t utf8) >(xargs -r -L 1 qrencode -o "$qr_file" --level=H)
 
   chmod 0600 "$qr_file" 2>/dev/null || true
   log "Linking command finished."

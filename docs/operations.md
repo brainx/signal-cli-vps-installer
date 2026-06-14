@@ -3,13 +3,13 @@
 ## Install
 
 ```bash
-sudo ./install.sh --account +31612345678 --device-name HomeOps-Signal
+sudo ./install.sh --account +31612345678 --device-name HomeOps-Signal --version 0.14.5 --sha256 SHA256
 ```
 
 Use multi-account daemon mode by omitting `--account`:
 
 ```bash
-sudo ./install.sh --no-link
+sudo ./install.sh --no-link --version 0.14.5 --sha256 SHA256
 ```
 
 In multi-account mode, JSON-RPC calls must include the `account` parameter.
@@ -17,15 +17,43 @@ In multi-account mode, JSON-RPC calls must include the `account` parameter.
 ## Pin a Release
 
 ```bash
-sudo ./install.sh --version 0.14.5 --account +31612345678
+sudo ./install.sh --version 0.14.5 --sha256 SHA256 --account +31612345678
 ```
 
 Pinning is recommended when rebuilding production hosts because it avoids surprise changes from the latest upstream release.
 
+## Preview Changes
+
+Dry-run mode prints the selected install mode, package plan, files to write, bind address, verification mode, and hardening choices without requiring root or changing the system:
+
+```bash
+./install.sh --dry-run --account +31612345678 --version 0.14.5
+```
+
+## Artifact Verification
+
+Use `--sha256` when you already have the expected release artifact digest:
+
+```bash
+sudo ./install.sh --version 0.14.5 --sha256 SHA256 --account +31612345678
+```
+
+Use `--checksum-url` when you publish or trust a checksum file containing the selected artifact name:
+
+```bash
+sudo ./install.sh --version 0.14.5 --checksum-url https://example.com/signal-cli-checksums.txt --account +31612345678
+```
+
+Unverified installs require an explicit unsafe opt-in:
+
+```bash
+sudo ./install.sh --verify none --allow-unverified-download --version 0.14.5 --account +31612345678
+```
+
 ## JVM Mode
 
 ```bash
-sudo ./install.sh --install-mode jvm --account +31612345678
+sudo ./install.sh --install-mode jvm --account +31612345678 --version 0.14.5 --sha256 SHA256
 ```
 
 JVM mode requires Java 25. The installer tries to install `openjdk-25-jre-headless` or `openjdk-25-jre` from apt when Java 25 is missing.
@@ -76,7 +104,7 @@ Then restart:
 sudo systemctl restart signal-cli
 ```
 
-Keep the bind address on localhost unless a separate authenticated transport protects access.
+Keep the bind address on localhost unless a separate authenticated transport protects access. Non-localhost binds require `--allow-public-bind` during install.
 
 ## Link Later
 
@@ -91,14 +119,19 @@ Then scan the QR code from Signal on the primary phone.
 
 ## Uninstall
 
-This repo does not ship an automated destructive uninstall. A manual cleanup typically involves:
+Default uninstall removes the service, wrapper, and runtime config while preserving linked-device state and installed binaries:
 
 ```bash
-sudo systemctl disable --now signal-cli
-sudo rm -f /etc/systemd/system/signal-cli.service
-sudo rm -f /usr/local/sbin/signal-cli-daemon-start
-sudo rm -f /etc/default/signal-cli
-sudo systemctl daemon-reload
+sudo scripts/uninstall.sh --dry-run
+sudo scripts/uninstall.sh
+```
+
+Explicit purge flags are available:
+
+```bash
+sudo scripts/uninstall.sh --purge-binaries
+sudo scripts/uninstall.sh --purge-hardening
+sudo scripts/uninstall.sh --purge-data --yes
 ```
 
 Remove `/var/lib/signal-cli` only after confirming you no longer need the linked-device state.

@@ -50,10 +50,11 @@ less install.sh
 Initial release of the signal-cli VPS installer.
 
 - Installs signal-cli in native or JVM mode.
+- Requires release artifact checksum material or an explicit unverified-download opt-in.
 - Creates a dedicated system user and private data directory.
 - Runs signal-cli as a hardened systemd JSON-RPC daemon.
 - Configures optional VPS hardening for UFW, fail2ban, sysctl, unattended upgrades, and SSH.
-- Includes operations and security-model documentation.
+- Includes operations, backup/restore, troubleshooting, and security-model documentation.
 ```
 
 ## README Positioning
@@ -62,6 +63,8 @@ Lead with operational clarity:
 
 - target OS and assumptions,
 - default localhost-only JSON-RPC binding,
+- explicit non-localhost bind opt-in,
+- release artifact verification behavior,
 - explicit root-run review warning,
 - systemd service and hardening details,
 - clear commands for install, health check, logs, and restart.

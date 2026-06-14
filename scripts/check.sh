@@ -8,11 +8,13 @@ echo "[check] bash syntax"
 bash -n install.sh
 bash -n scripts/check.sh
 bash -n scripts/uninstall.sh
+bash -n scripts/upgrade-signal-cli.sh
+bash -n scripts/rollback-signal-cli.sh
 bash -n tests/run-tests.sh
 
 if command -v shellcheck >/dev/null 2>&1; then
   echo "[check] shellcheck"
-  shellcheck install.sh scripts/check.sh scripts/uninstall.sh tests/run-tests.sh
+  shellcheck install.sh scripts/check.sh scripts/uninstall.sh scripts/upgrade-signal-cli.sh scripts/rollback-signal-cli.sh tests/run-tests.sh
 else
   echo "[check] shellcheck not installed; skipping"
 fi

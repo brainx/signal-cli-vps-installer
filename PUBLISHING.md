@@ -38,6 +38,18 @@ shell
 git status --short
 ```
 
+## Release Checklist
+
+Before tagging a release:
+
+- run `./scripts/check.sh`;
+- confirm the latest GitHub Actions run is green;
+- verify README install examples still match the current flags;
+- publish or link checksum material for release artifacts;
+- test `scripts/upgrade-signal-cli.sh --dry-run`;
+- test `scripts/rollback-signal-cli.sh --dry-run`;
+- confirm compatibility claims match CI coverage.
+
 Read the installer end to end before the first public commit:
 
 ```bash

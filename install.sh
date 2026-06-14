@@ -2,15 +2,23 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
+INSTALL_ROOT="${INSTALL_ROOT:-}"
+root_path() {
+  printf '%s%s\n' "$INSTALL_ROOT" "$1"
+}
+
 SERVICE_USER="signal-cli"
 SERVICE_GROUP="signal-cli"
-DATA_DIR="/var/lib/signal-cli"
-CONFIG_FILE="/etc/default/signal-cli"
-WRAPPER_FILE="/usr/local/sbin/signal-cli-daemon-start"
-SERVICE_FILE="/etc/systemd/system/signal-cli.service"
-FAIL2BAN_FILE="/etc/fail2ban/jail.d/sshd.local"
-SYSCTL_FILE="/etc/sysctl.d/99-signal-cli-server-hardening.conf"
-SSH_HARDENING_FILE="/etc/ssh/sshd_config.d/99-signal-cli-hardening.conf"
+DATA_DIR="$(root_path /var/lib/signal-cli)"
+CONFIG_FILE="$(root_path /etc/default/signal-cli)"
+WRAPPER_FILE="$(root_path /usr/local/sbin/signal-cli-daemon-start)"
+SERVICE_FILE="$(root_path /etc/systemd/system/signal-cli.service)"
+FAIL2BAN_FILE="$(root_path /etc/fail2ban/jail.d/sshd.local)"
+SYSCTL_FILE="$(root_path /etc/sysctl.d/99-signal-cli-server-hardening.conf)"
+SSH_HARDENING_FILE="$(root_path /etc/ssh/sshd_config.d/99-signal-cli-hardening.conf)"
+UNATTENDED_UPGRADES_FILE="$(root_path /etc/apt/apt.conf.d/20auto-upgrades)"
+OPT_DIR="$(root_path /opt)"
+LOCAL_BIN_DIR="$(root_path /usr/local/bin)"
 
 SIGNAL_ACCOUNT="${SIGNAL_ACCOUNT:-}"
 DEVICE_NAME="${DEVICE_NAME:-}"
@@ -24,6 +32,7 @@ ENABLE_UNATTENDED_UPGRADES="${ENABLE_UNATTENDED_UPGRADES:-true}"
 SSH_HARDENING="${SSH_HARDENING:-ask}" # ask | true | false
 RUN_APT_UPGRADE="${RUN_APT_UPGRADE:-false}"
 VERSION="${VERSION:-}"
+ARTIFACT_FILE="${ARTIFACT_FILE:-}"
 
 VERIFY_MODE="${VERIFY_MODE:-auto}" # auto | sha256 | none
 ALLOW_UNVERIFIED_DOWNLOAD="${ALLOW_UNVERIFIED_DOWNLOAD:-false}"
@@ -39,6 +48,9 @@ SIGNAL_CLI_URL=""
 SIGNAL_CLI_TMPDIR=""
 SIGNAL_CLI_ARTIFACT=""
 BASE_PACKAGES=()
+BOOTSTRAP_PACKAGES=(ca-certificates curl)
+BIND_HOST=""
+BIND_PORT=""
 CURRENT_STAGE="startup"
 
 log() { printf '\n[+] %s\n' "$*"; }
@@ -65,6 +77,7 @@ Options:
   --jvm                        Same as --install-mode jvm.
   --version VERSION            Pin signal-cli version, for example 0.14.5. Default: latest.
   --signal-cli-version VERSION Same as --version.
+  --artifact-file PATH         Use a local release artifact instead of downloading one.
   --verify auto|sha256|none    Release artifact verification mode. Default: auto.
   --sha256 SHA256              Expected SHA256 for the downloaded release artifact.
   --checksum-url URL           HTTPS URL to a SHA256 checksum file containing the release artifact.
@@ -96,7 +109,7 @@ is_true() {
 }
 
 is_dry_run() {
-  is_true "$DRY_RUN" || is_true "$TEST_MODE"
+  is_true "$DRY_RUN"
 }
 
 set_stage() {
@@ -130,9 +143,22 @@ run_cmd() {
   fi
 }
 
+maybe_systemctl() {
+  if is_true "$TEST_MODE"; then
+    printf '[test-mode] skip systemctl'
+    printf ' %q' "$@"
+    printf '\n'
+    return 0
+  fi
+
+  systemctl "$@"
+}
+
 write_rendered_file() {
   local target="$1"
   shift
+
+  run_cmd install -d -m 0755 "$(dirname "$target")"
 
   if is_dry_run; then
     printf '[dry-run] write %s\n' "$target"
@@ -207,6 +233,11 @@ parse_args() {
         VERSION="$2"
         shift 2
         ;;
+      --artifact-file)
+        [[ $# -ge 2 ]] || die "--artifact-file requires a value"
+        ARTIFACT_FILE="$2"
+        shift 2
+        ;;
       --verify)
         [[ $# -ge 2 ]] || die "--verify requires auto, sha256, or none"
         VERIFY_MODE="$2"
@@ -279,7 +310,7 @@ parse_args() {
 }
 
 require_root() {
-  if is_dry_run; then
+  if is_dry_run || is_true "$TEST_MODE"; then
     return 0
   fi
 
@@ -292,6 +323,68 @@ validate_port() {
   local port="$1"
   [[ "$port" =~ ^[0-9]+$ ]] || return 1
   ((port >= 1 && port <= 65535))
+}
+
+split_bind() {
+  local bind="$1"
+  BIND_HOST=""
+  BIND_PORT=""
+
+  if [[ "$bind" =~ ^(\[[0-9A-Fa-f:.]+\]):([0-9]+)$ ]]; then
+    BIND_HOST="${BASH_REMATCH[1]}"
+    BIND_PORT="${BASH_REMATCH[2]}"
+    return 0
+  fi
+
+  if [[ "$bind" =~ ^([^:]+):([0-9]+)$ ]]; then
+    BIND_HOST="${BASH_REMATCH[1]}"
+    BIND_PORT="${BASH_REMATCH[2]}"
+    return 0
+  fi
+
+  return 1
+}
+
+validate_ipv4_host() {
+  local host="$1"
+  local IFS=.
+  local -a parts
+  local part
+
+  [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  read -r -a parts <<<"$host"
+  [[ "${#parts[@]}" -eq 4 ]] || return 1
+
+  for part in "${parts[@]}"; do
+    [[ "$part" =~ ^[0-9]+$ ]] || return 1
+    ((part >= 0 && part <= 255)) || return 1
+  done
+}
+
+validate_hostname() {
+  local host="$1"
+  [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] || return 1
+  [[ "$host" != *..* ]] || return 1
+}
+
+validate_bracketed_ipv6() {
+  local host="$1"
+  [[ "$host" =~ ^\[[0-9A-Fa-f:.]+\]$ ]] || return 1
+}
+
+contains_shell_unsafe_chars() {
+  local value="$1"
+
+  [[ "$value" == *$'\n'* ]] && return 0
+  [[ "$value" == *$'\r'* ]] && return 0
+  [[ "$value" == *$'\t'* ]] && return 0
+  [[ "$value" == *" "* ]] && return 0
+
+  case "$value" in
+    *"'"* | *"\""* | *"\`"* | *'$'* | *"\\"* | *";"* | *"&"* | *"|"* | *"<"* | *">"* | *"("* | *")"* | *"{"* | *"}"*) return 0 ;;
+  esac
+
+  return 1
 }
 
 is_local_bind() {
@@ -316,14 +409,24 @@ bind_port() {
 }
 
 validate_bind() {
-  local port
-  port="$(bind_port "$HTTP_BIND" || true)"
-  if [[ -z "$port" ]] || ! validate_port "$port"; then
-    die "Invalid --bind. Expected HOST:PORT with port 1-65535, for example 127.0.0.1:8080."
+  if ! split_bind "$HTTP_BIND"; then
+    die "Invalid --bind. Expected HOST:PORT, for example 127.0.0.1:8080."
+  fi
+
+  if ! validate_port "$BIND_PORT"; then
+    die "Invalid --bind port. Expected 1-65535."
+  fi
+
+  if contains_shell_unsafe_chars "$HTTP_BIND"; then
+    die "Invalid --bind. Refusing shell-unsafe characters."
   fi
 
   if is_local_bind "$HTTP_BIND"; then
     return 0
+  fi
+
+  if ! validate_ipv4_host "$BIND_HOST" && ! validate_hostname "$BIND_HOST" && ! validate_bracketed_ipv6 "$BIND_HOST"; then
+    die "Invalid --bind host. Use IPv4, bracketed IPv6, localhost, or a simple hostname."
   fi
 
   if ! is_true "$ALLOW_PUBLIC_BIND"; then
@@ -333,12 +436,20 @@ validate_bind() {
   warn "Public/non-localhost bind enabled: $HTTP_BIND. Do not expose signal-cli JSON-RPC directly to the internet."
 }
 
+validate_device_name() {
+  [[ -n "$DEVICE_NAME" ]] || die "Device name cannot be empty."
+  ((${#DEVICE_NAME} <= 64)) || die "Device name is too long; max 64 characters."
+  [[ "$DEVICE_NAME" != *$'\n'* ]] || die "Device name cannot contain newlines."
+  [[ "$DEVICE_NAME" != *$'\r'* ]] || die "Device name cannot contain carriage returns."
+  [[ ! "$DEVICE_NAME" =~ [[:cntrl:]] ]] || die "Device name cannot contain control characters."
+}
+
 validate_inputs() {
   if [[ -z "$DEVICE_NAME" ]]; then
     DEVICE_NAME="$(hostname -s 2>/dev/null || hostname)-signal-cli"
   fi
 
-  if [[ -r /dev/tty ]] && ! is_dry_run; then
+  if [[ -r /dev/tty ]] && ! is_dry_run && ! is_true "$TEST_MODE"; then
     if [[ -z "$SIGNAL_ACCOUNT" ]]; then
       read -r -p "Signal account number, e.g. +31612345678. Leave blank for multi-account mode: " SIGNAL_ACCOUNT </dev/tty || true
     fi
@@ -347,6 +458,8 @@ validate_inputs() {
     read -r -p "Linked device name [$DEVICE_NAME]: " input_device </dev/tty || true
     DEVICE_NAME="${input_device:-$DEVICE_NAME}"
   fi
+
+  validate_device_name
 
   if [[ -n "$SIGNAL_ACCOUNT" && ! "$SIGNAL_ACCOUNT" =~ ^\+[1-9][0-9]{6,14}$ ]]; then
     die "Invalid --account. Use international E.164 format, for example +31612345678."
@@ -370,6 +483,11 @@ validate_inputs() {
         die "--checksum-url must be HTTPS."
       fi
     fi
+  fi
+
+  if [[ -n "$ARTIFACT_FILE" ]]; then
+    [[ "$ARTIFACT_FILE" != http://* && "$ARTIFACT_FILE" != https://* ]] || die "--artifact-file must be a local file path."
+    [[ -f "$ARTIFACT_FILE" ]] || die "--artifact-file does not exist: $ARTIFACT_FILE"
   fi
 
   if [[ "$SSH_HARDENING" == "ask" ]]; then
@@ -420,6 +538,11 @@ preflight_checks() {
     return 0
   fi
 
+  if is_true "$TEST_MODE"; then
+    printf '[test-mode] skip host mutation preflight checks\n'
+    return 0
+  fi
+
   command -v apt-get >/dev/null 2>&1 || die "apt-get not found. This installer supports Debian/Ubuntu only."
   command -v systemctl >/dev/null 2>&1 || die "systemctl not found. This installer requires systemd."
   [[ -d /run/systemd/system ]] || die "systemd does not appear to be PID 1. This installer targets systemd servers."
@@ -459,6 +582,32 @@ build_base_packages() {
   fi
 }
 
+install_bootstrap_packages() {
+  set_stage "bootstrap packages"
+
+  if is_dry_run; then
+    printf '[dry-run] ensure bootstrap packages: %s\n' "${BOOTSTRAP_PACKAGES[*]}"
+    return 0
+  fi
+
+  if is_true "$TEST_MODE"; then
+    printf '[test-mode] skip bootstrap package installation: %s\n' "${BOOTSTRAP_PACKAGES[*]}"
+    return 0
+  fi
+
+  local missing=()
+  command -v curl >/dev/null 2>&1 || missing+=(curl)
+
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  export DEBIAN_FRONTEND=noninteractive
+  log "Installing bootstrap packages: ca-certificates ${missing[*]}."
+  apt-get update
+  apt-get install -y ca-certificates "${missing[@]}"
+}
+
 apt_pkg_available() {
   apt-cache show "$1" >/dev/null 2>&1
 }
@@ -496,6 +645,12 @@ install_java25_if_needed() {
 
 install_base_packages() {
   set_stage "package installation"
+
+  if is_true "$TEST_MODE"; then
+    printf '[test-mode] skip base package installation: %s\n' "${BASE_PACKAGES[*]}"
+    return 0
+  fi
+
   export DEBIAN_FRONTEND=noninteractive
 
   log "Updating apt metadata."
@@ -553,6 +708,12 @@ download_signal_cli_artifact() {
   set_stage "artifact download"
   SIGNAL_CLI_TMPDIR="$(mktemp -d)"
   SIGNAL_CLI_ARTIFACT="$SIGNAL_CLI_TMPDIR/$SIGNAL_CLI_ASSET"
+
+  if [[ -n "$ARTIFACT_FILE" ]]; then
+    log "Using local signal-cli artifact: $ARTIFACT_FILE."
+    run_cmd cp "$ARTIFACT_FILE" "$SIGNAL_CLI_ARTIFACT"
+    return 0
+  fi
 
   log "Downloading signal-cli $RESOLVED_VERSION ($INSTALL_MODE)."
   run_cmd curl -fL --retry 3 --proto '=https' --tlsv1.2 -o "$SIGNAL_CLI_ARTIFACT" "$SIGNAL_CLI_URL"
@@ -658,9 +819,19 @@ verify_signal_cli_artifact() {
   esac
 }
 
+switch_signal_cli_symlink() {
+  local target="$1"
+  local link_path="$LOCAL_BIN_DIR/signal-cli"
+  local temp_link="$LOCAL_BIN_DIR/signal-cli.new"
+
+  run_cmd install -d -m 0755 "$LOCAL_BIN_DIR"
+  run_cmd ln -sfn "$target" "$temp_link"
+  run_cmd mv -f "$temp_link" "$link_path"
+}
+
 install_signal_cli_from_artifact() {
   set_stage "signal-cli install"
-  local extract_dir candidate
+  local extract_dir candidate install_dir target
   extract_dir="$SIGNAL_CLI_TMPDIR/extract"
   run_cmd mkdir -p "$extract_dir"
 
@@ -672,21 +843,33 @@ install_signal_cli_from_artifact() {
     candidate="$(find "$extract_dir" -type f -name signal-cli -perm -111 | head -n 1 || true)"
     [[ -n "$candidate" ]] || die "Could not find native signal-cli binary in release archive."
 
-    run_cmd install -d -m 0755 "/opt/signal-cli-native-${RESOLVED_VERSION}"
-    run_cmd install -m 0755 "$candidate" "/opt/signal-cli-native-${RESOLVED_VERSION}/signal-cli"
-    run_cmd ln -sfn "/opt/signal-cli-native-${RESOLVED_VERSION}/signal-cli" /usr/local/bin/signal-cli
+    install_dir="$OPT_DIR/signal-cli-native-${RESOLVED_VERSION}"
+    target="$install_dir/signal-cli"
+    run_cmd install -d -m 0755 "$install_dir"
+    run_cmd install -m 0755 "$candidate" "$target"
+    switch_signal_cli_symlink "$target"
   else
-    run_cmd rm -rf "/opt/signal-cli-${RESOLVED_VERSION}"
-    run_cmd tar xf "$SIGNAL_CLI_ARTIFACT" -C /opt
-    [[ -x "/opt/signal-cli-${RESOLVED_VERSION}/bin/signal-cli" ]] || die "Could not find JVM signal-cli launcher after extraction."
-    run_cmd ln -sfn "/opt/signal-cli-${RESOLVED_VERSION}/bin/signal-cli" /usr/local/bin/signal-cli
+    install_dir="$OPT_DIR/signal-cli-${RESOLVED_VERSION}"
+    target="$install_dir/bin/signal-cli"
+    run_cmd install -d -m 0755 "$OPT_DIR"
+    run_cmd rm -rf "$install_dir"
+    run_cmd tar xf "$SIGNAL_CLI_ARTIFACT" -C "$OPT_DIR"
+    [[ -x "$target" ]] || die "Could not find JVM signal-cli launcher after extraction."
+    switch_signal_cli_symlink "$target"
   fi
 
-  run_cmd /usr/local/bin/signal-cli --version
+  run_cmd "$LOCAL_BIN_DIR/signal-cli" --version
 }
 
 create_service_user() {
   set_stage "service user"
+
+  if is_true "$TEST_MODE"; then
+    log "Creating test-mode data directory."
+    run_cmd install -d -m 0700 "$DATA_DIR"
+    return 0
+  fi
+
   local nologin_shell
   nologin_shell="$(command -v nologin || true)"
   nologin_shell="${nologin_shell:-/usr/sbin/nologin}"
@@ -718,6 +901,11 @@ detected_ssh_ports() {
 configure_ufw() {
   is_true "$ENABLE_UFW" || return 0
   set_stage "ufw configuration"
+
+  if is_true "$TEST_MODE"; then
+    printf '[test-mode] skip UFW configuration\n'
+    return 0
+  fi
 
   local ports=() port
   mapfile -t ports < <(detected_ssh_ports || true)
@@ -769,11 +957,11 @@ configure_fail2ban() {
   )"
 
   log "Configuring fail2ban for SSH."
-  run_cmd install -d -m 0755 /etc/fail2ban/jail.d
+  run_cmd install -d -m 0755 "$(dirname "$FAIL2BAN_FILE")"
   write_rendered_file "$FAIL2BAN_FILE" render_fail2ban_jail "$ports_csv"
 
-  run_cmd systemctl enable --now fail2ban
-  run_cmd systemctl restart fail2ban
+  run_cmd maybe_systemctl enable --now fail2ban
+  run_cmd maybe_systemctl restart fail2ban
 }
 
 render_ssh_hardening_config() {
@@ -799,15 +987,15 @@ configure_ssh_hardening() {
   fi
 
   log "Applying SSH hardening."
-  run_cmd install -d -m 0755 /etc/ssh/sshd_config.d
+  run_cmd install -d -m 0755 "$(dirname "$SSH_HARDENING_FILE")"
   write_rendered_file "$SSH_HARDENING_FILE" render_ssh_hardening_config
 
-  if ! is_dry_run && ! sshd -t; then
+  if ! is_dry_run && ! is_true "$TEST_MODE" && ! sshd -t; then
     rm -f "$SSH_HARDENING_FILE"
     die "SSH config test failed. Rolled back SSH hardening file."
   fi
 
-  run_cmd systemctl reload ssh || run_cmd systemctl reload sshd || run_cmd systemctl restart ssh || run_cmd systemctl restart sshd || true
+  run_cmd maybe_systemctl reload ssh || run_cmd maybe_systemctl reload sshd || run_cmd maybe_systemctl restart ssh || run_cmd maybe_systemctl restart sshd || true
 }
 
 render_sysctl_config() {
@@ -838,6 +1026,8 @@ configure_sysctl_hardening() {
   write_rendered_file "$SYSCTL_FILE" render_sysctl_config
   if is_dry_run; then
     run_cmd sysctl --system
+  elif is_true "$TEST_MODE"; then
+    printf '[test-mode] skip sysctl --system\n'
   else
     sysctl --system >/dev/null || warn "Some sysctl settings could not be applied on this kernel."
   fi
@@ -856,8 +1046,8 @@ configure_unattended_upgrades() {
   set_stage "unattended upgrades"
 
   log "Enabling unattended security upgrades."
-  write_rendered_file /etc/apt/apt.conf.d/20auto-upgrades render_unattended_upgrades_config
-  run_cmd systemctl enable --now unattended-upgrades || true
+  write_rendered_file "$UNATTENDED_UPGRADES_FILE" render_unattended_upgrades_config
+  run_cmd maybe_systemctl enable --now unattended-upgrades || true
 }
 
 render_runtime_config() {
@@ -872,22 +1062,26 @@ write_runtime_config() {
   set_stage "runtime config"
   log "Writing signal-cli runtime config."
   write_rendered_file "$CONFIG_FILE" render_runtime_config
-  run_cmd chown "root:$SERVICE_GROUP" "$CONFIG_FILE"
+  if is_true "$TEST_MODE"; then
+    printf '[test-mode] skip chown root:%s %s\n' "$SERVICE_GROUP" "$CONFIG_FILE"
+  else
+    run_cmd chown "root:$SERVICE_GROUP" "$CONFIG_FILE"
+  fi
   run_cmd chmod 0640 "$CONFIG_FILE"
 }
 
 render_wrapper() {
-  cat <<'EOF'
+  cat <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-source /etc/default/signal-cli
+source "$CONFIG_FILE"
 
-args=(--data-dir "$SIGNAL_CLI_DATA_DIR")
-if [[ -n "${SIGNAL_CLI_ACCOUNT:-}" ]]; then
-  args+=(-a "$SIGNAL_CLI_ACCOUNT")
+args=(--data-dir "\$SIGNAL_CLI_DATA_DIR")
+if [[ -n "\${SIGNAL_CLI_ACCOUNT:-}" ]]; then
+  args+=(-a "\$SIGNAL_CLI_ACCOUNT")
 fi
 
-exec /usr/local/bin/signal-cli "${args[@]}" daemon --http "$SIGNAL_CLI_HTTP_BIND"
+exec "$LOCAL_BIN_DIR/signal-cli" "\${args[@]}" daemon --http "\$SIGNAL_CLI_HTTP_BIND"
 EOF
 }
 
@@ -915,7 +1109,7 @@ PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=$DATA_DIR
-ReadOnlyPaths=/opt /usr/local/bin /usr/local/sbin
+ReadOnlyPaths=$OPT_DIR $LOCAL_BIN_DIR $(root_path /usr/local/sbin)
 CapabilityBoundingSet=
 AmbientCapabilities=
 LockPersonality=true
@@ -958,7 +1152,7 @@ A PNG copy is also written to: $qr_file
 EOF
 
   runuser -u "$SERVICE_USER" -- env HOME="$DATA_DIR" XDG_DATA_HOME="$DATA_DIR" \
-    /usr/local/bin/signal-cli --data-dir "$DATA_DIR" link -n "$DEVICE_NAME" |
+    "$LOCAL_BIN_DIR/signal-cli" --data-dir "$DATA_DIR" link -n "$DEVICE_NAME" |
     tee >(xargs -r -L 1 qrencode -t utf8) >(xargs -r -L 1 qrencode -o "$qr_file" --level=H)
 
   chmod 0600 "$qr_file" 2>/dev/null || true
@@ -974,7 +1168,7 @@ run_initial_receive() {
 
   log "Running a short initial receive pass for contacts/groups sync."
   run_cmd timeout 30s runuser -u "$SERVICE_USER" -- env HOME="$DATA_DIR" XDG_DATA_HOME="$DATA_DIR" \
-    /usr/local/bin/signal-cli --data-dir "$DATA_DIR" -a "$SIGNAL_ACCOUNT" receive || true
+    "$LOCAL_BIN_DIR/signal-cli" --data-dir "$DATA_DIR" -a "$SIGNAL_ACCOUNT" receive || true
 }
 
 write_systemd_service() {
@@ -982,13 +1176,17 @@ write_systemd_service() {
   log "Writing systemd service."
 
   write_rendered_file "$WRAPPER_FILE" render_wrapper
-  run_cmd chown root:root "$WRAPPER_FILE"
+  if is_true "$TEST_MODE"; then
+    printf '[test-mode] skip chown root:root %s\n' "$WRAPPER_FILE"
+  else
+    run_cmd chown root:root "$WRAPPER_FILE"
+  fi
   run_cmd chmod 0755 "$WRAPPER_FILE"
 
   write_rendered_file "$SERVICE_FILE" render_systemd_service
 
-  run_cmd systemctl daemon-reload
-  run_cmd systemctl enable --now signal-cli.service
+  run_cmd maybe_systemctl daemon-reload
+  run_cmd maybe_systemctl enable --now signal-cli.service
 }
 
 health_check() {
@@ -997,6 +1195,11 @@ health_check() {
 
   if is_dry_run; then
     printf '[dry-run] curl -fsS http://%s/api/v1/check\n' "$HTTP_BIND"
+    return 0
+  fi
+
+  if is_true "$TEST_MODE"; then
+    printf '[test-mode] skip health check http://%s/api/v1/check\n' "$HTTP_BIND"
     return 0
   fi
 
@@ -1098,9 +1301,10 @@ main() {
   validate_inputs
   choose_install_mode
   preflight_checks
+  build_base_packages
+  install_bootstrap_packages
   resolve_signal_cli_version
   build_signal_cli_asset_url
-  build_base_packages
   print_install_plan
 
   if is_dry_run; then

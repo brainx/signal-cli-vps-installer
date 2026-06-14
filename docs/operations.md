@@ -90,6 +90,44 @@ journalctl -u signal-cli -n 100 --no-pager
 sudo systemctl restart signal-cli
 ```
 
+## Upgrade signal-cli
+
+Upgrade only changes the installed binary and symlink. It does not relink the Signal device or remove `/var/lib/signal-cli`.
+
+Preview:
+
+```bash
+scripts/upgrade-signal-cli.sh --dry-run --version 0.14.6 --install-mode native --sha256 SHA256
+```
+
+Run:
+
+```bash
+sudo scripts/upgrade-signal-cli.sh --version 0.14.6 --install-mode native --sha256 SHA256
+```
+
+Skip service restart when you want to restart manually:
+
+```bash
+sudo scripts/upgrade-signal-cli.sh --version 0.14.6 --install-mode native --sha256 SHA256 --no-restart
+```
+
+## Roll Back signal-cli
+
+Rollback switches `/usr/local/bin/signal-cli` back to an existing version under `/opt` and restarts the service. It does not delete any installed versions.
+
+Preview:
+
+```bash
+scripts/rollback-signal-cli.sh --dry-run --to-version 0.14.5 --install-mode native
+```
+
+Run:
+
+```bash
+sudo scripts/rollback-signal-cli.sh --to-version 0.14.5 --install-mode native
+```
+
 ## Reconfigure Bind Address
 
 Edit:

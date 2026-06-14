@@ -15,6 +15,7 @@ This installer is intentionally small, but it performs privileged actions. Revie
 - The installer runs as root and writes to `/etc`, `/opt`, `/usr/local`, and `/var/lib`.
 - signal-cli release artifacts are downloaded from GitHub over HTTPS.
 - Release artifacts are verified with SHA256 material when `--sha256` or `--checksum-url` is provided.
+- Local artifacts supplied with `--artifact-file` still pass through the same SHA256 verification path.
 - The JSON-RPC daemon accepts local HTTP requests by default.
 - Any automation calling JSON-RPC becomes part of the trusted local system.
 
@@ -44,6 +45,7 @@ This installer is intentionally small, but it performs privileged actions. Revie
 
 - Do not bind JSON-RPC to a public interface unless it is behind a separate authenticated control plane.
 - Prefer pinned `--version` plus `--sha256` for production rebuilds.
+- Keep checksum material from a trusted source and match it to the selected install mode.
 - Keep the VPS patched.
 - Rotate access and rebuild the linked device if the data directory is exposed.
 - Confirm SSH key login before enabling `--ssh-hardening`.

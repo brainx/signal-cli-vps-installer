@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "--version" ]]; then
+  echo "signal-cli 0.0.0 fixture"
+  exit 0
+fi
+
+echo "fixture signal-cli"

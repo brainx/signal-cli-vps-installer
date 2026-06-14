@@ -68,6 +68,7 @@ curl -i http://127.0.0.1:8080/api/v1/check
 --allow-public-bind          Allow non-localhost bind. Use only behind authenticated transport.
 --install-mode auto|native|jvm
 --version VERSION            Pin a signal-cli release.
+--artifact-file PATH         Use a local release artifact instead of downloading one.
 --verify auto|sha256|none    Release artifact verification mode.
 --sha256 SHA256              Expected SHA256 for the downloaded release artifact.
 --checksum-url URL           HTTPS URL to a SHA256 checksum file.
@@ -158,6 +159,7 @@ More detail:
 
 - [Security model](docs/security-model.md)
 - [Operations](docs/operations.md)
+- [Checksum guidance](docs/checksums.md)
 - [Backup and restore](docs/backup-restore.md)
 - [Troubleshooting](docs/troubleshooting.md)
 

@@ -17,7 +17,7 @@ jobs:
       - name: Install shell tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck shfmt
+          sudo apt-get install -y shellcheck shfmt systemd
 
       - name: Run checks
         run: ./scripts/check.sh
@@ -39,7 +39,7 @@ jobs:
       - name: Install test dependencies
         run: |
           apt-get update
-          apt-get install -y bash ca-certificates coreutils grep
+          apt-get install -y bash ca-certificates coreutils findutils grep tar
 
       - name: Run validation tests
         run: tests/run-tests.sh

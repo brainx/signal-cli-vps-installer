@@ -266,6 +266,14 @@ expect_success "systemd unit verifies when systemd-analyze exists" bash -c '
   cd "$1"
   source ./install.sh
   work_dir="$(mktemp -d)"
+  DATA_DIR="$work_dir/data"
+  CONFIG_FILE="$work_dir/signal-cli.env"
+  WRAPPER_FILE="$work_dir/signal-cli-daemon-start"
+  OPT_DIR="$work_dir/opt"
+  LOCAL_BIN_DIR="$work_dir/bin"
+  mkdir -p "$DATA_DIR" "$OPT_DIR" "$LOCAL_BIN_DIR"
+  printf "#!/usr/bin/env bash\nexit 0\n" > "$WRAPPER_FILE"
+  chmod +x "$WRAPPER_FILE"
   rendered="$work_dir/signal-cli.service"
   render_systemd_service > "$rendered"
   if command -v systemd-analyze >/dev/null 2>&1; then

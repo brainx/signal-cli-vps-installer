@@ -1138,6 +1138,29 @@ WantedBy=multi-user.target
 EOF
 }
 
+render_signal_link_qr() {
+  local qr_file="${1:-}"
+  local line=""
+  local link_uri=""
+
+  [[ -n "$qr_file" ]] || die "QR output file path is required."
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    printf '%s\n' "$line"
+
+    if [[ -z "$link_uri" && "$line" =~ (sgnl://linkdevice[^[:space:]]+) ]]; then
+      link_uri="${BASH_REMATCH[1]}"
+      printf '%s\n' "$link_uri" | qrencode -t utf8
+      printf '%s\n' "$link_uri" | qrencode -o "$qr_file" --level=H
+    fi
+  done
+
+  if [[ -z "$link_uri" ]]; then
+    warn "signal-cli did not emit a Signal link URI; QR code was not generated."
+    return 1
+  fi
+}
+
 link_signal_device() {
   is_true "$RUN_LINK" || return 0
   set_stage "device linking"
@@ -1170,7 +1193,7 @@ EOF
 
   runuser -u "$SERVICE_USER" -- env HOME="$DATA_DIR" XDG_DATA_HOME="$DATA_DIR" \
     "$LOCAL_BIN_DIR/signal-cli" --data-dir "$DATA_DIR" link -n "$DEVICE_NAME" |
-    tee >(xargs -r -L 1 qrencode -t utf8) >(xargs -r -L 1 qrencode -o "$qr_file" --level=H)
+    render_signal_link_qr "$qr_file"
 
   chmod 0600 "$qr_file" 2>/dev/null || true
   log "Linking command finished."

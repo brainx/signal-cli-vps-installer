@@ -1,13 +1,15 @@
 # Troubleshooting
 
-## QR Code Does Not Appear
+## QR Code Does Not Appear or Scans Wrong
 
-Likely cause: `qrencode` is missing or signal-cli link output changed.
+Likely cause: `qrencode` is missing, or signal-cli did not print a `sgnl://linkdevice...` URI before the link session closed. The installer only QR-encodes that URI; status text and errors are not valid QR payloads.
 
 Check:
 
 ```bash
 command -v qrencode
+sudo runuser -u signal-cli -- env HOME=/var/lib/signal-cli XDG_DATA_HOME=/var/lib/signal-cli \
+  signal-cli --data-dir /var/lib/signal-cli link -n HomeOps-Signal
 ```
 
 Fix:
@@ -15,6 +17,8 @@ Fix:
 ```bash
 sudo apt-get install -y qrencode
 ```
+
+If the manual link command never prints a `sgnl://linkdevice...` URI, check the VPS clock and outbound connectivity, then rerun linking.
 
 ## Link Command Hangs
 

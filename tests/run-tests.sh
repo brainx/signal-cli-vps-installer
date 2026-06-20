@@ -240,6 +240,55 @@ expect_output_contains "test-mode skips initial receive" "[test-mode] skip initi
     --sha256 "$digest"
 ' bash "$ROOT_DIR" "$NATIVE_FIXTURE_ARCHIVE" "$(file_sha256 "$NATIVE_FIXTURE_ARCHIVE")"
 
+expect_success "link QR renderer uses only Signal link URI" bash -c '
+  set -Eeuo pipefail
+  cd "$1"
+  source ./install.sh
+
+  work_dir="$(mktemp -d)"
+  trap '\''rm -rf "$work_dir"'\'' EXIT
+  fake_bin="$work_dir/bin"
+  mkdir -p "$fake_bin"
+  cat > "$fake_bin/qrencode" <<'\''EOF'\''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+output=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o)
+      output="$2"
+      shift 2
+      ;;
+    -t|--level)
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+payload="$(cat)"
+printf "%s\n" "$payload" >> "$QR_PAYLOAD_LOG"
+if [[ -n "$output" ]]; then
+  printf "%s\n" "$payload" > "$output"
+fi
+EOF
+  chmod +x "$fake_bin/qrencode"
+
+  export PATH="$fake_bin:$PATH"
+  export QR_PAYLOAD_LOG="$work_dir/payloads"
+  link_uri="sgnl://linkdevice?uuid=abc123&pub_key=def456"
+  {
+    printf "Open Signal on your phone\n"
+    printf "%s\n" "$link_uri"
+    printf "Waiting for scan\n"
+  } | render_signal_link_qr "$work_dir/link.png" >/dev/null
+
+  test "$(wc -l < "$QR_PAYLOAD_LOG" | tr -d " ")" = "2"
+  test "$(sort -u "$QR_PAYLOAD_LOG")" = "$link_uri"
+  test "$(cat "$work_dir/link.png")" = "$link_uri"
+' bash "$ROOT_DIR"
+
 expect_success "fixture rollback switches symlink" bash -c '
   set -Eeuo pipefail
   cd "$1"

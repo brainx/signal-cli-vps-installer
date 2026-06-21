@@ -47,7 +47,7 @@ Before tagging a release:
 - verify README install examples still match the current flags;
 - publish or link checksum material for release artifacts;
 - test `scripts/upgrade-signal-cli.sh --dry-run`;
-- test `scripts/rollback-signal-cli.sh --dry-run`;
+- test `scripts/rollback-signal-cli.sh --dry-run --to-version 0.14.5 --install-mode native`;
 - confirm upgrade and rollback scripts are non-interactive in dry-run and `TEST_MODE`;
 - confirm compatibility claims match CI coverage.
 

@@ -104,7 +104,7 @@ Upgrade and rollback scripts are binary-only lifecycle tools. They do not prompt
 | Dedicated system user | yes | `signal-cli` |
 | Private data directory | yes | `/var/lib/signal-cli` |
 | UFW deny inbound | yes | system firewall |
-| fail2ban SSH jail | yes | `/etc/fail2ban/jail.d/sshd.local` |
+| fail2ban SSH jail | yes | `/etc/fail2ban/jail.d/99-signal-cli-sshd.local` |
 | systemd `NoNewPrivileges` | yes | `signal-cli.service` |
 | systemd `ProtectSystem=strict` | yes | `signal-cli.service` |
 | SSH password disable | optional | `/etc/ssh/sshd_config.d/99-signal-cli-hardening.conf` |
@@ -118,7 +118,7 @@ Upgrade and rollback scripts are binary-only lifecycle tools. They do not prompt
 | Debian 13 | planned |
 | Ubuntu 26.04 LTS | planned |
 | `x86_64`/`amd64` native | validation tests |
-| ARM64 JVM | validation tests |
+| ARM64 JVM | install-mode selection only; full JVM runtime validation pending |
 
 ## After Install
 

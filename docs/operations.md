@@ -148,14 +148,13 @@ Keep the bind address on localhost unless a separate authenticated transport pro
 
 ## Link Later
 
-If installed with `--no-link`, run signal-cli linking manually as the service user:
+If installed with `--no-link`, rerun the installer without `--no-link` so it stops any existing daemon before provisioning and renders a terminal-safe QR code:
 
 ```bash
-sudo runuser -u signal-cli -- env HOME=/var/lib/signal-cli XDG_DATA_HOME=/var/lib/signal-cli \
-  signal-cli --data-dir /var/lib/signal-cli link -n HomeOps-Signal
+sudo ./install.sh --account +31612345678 --device-name HomeOps-Signal --version 0.14.5 --sha256 SHA256
 ```
 
-Then scan the QR code from Signal on the primary phone.
+Then scan the QR code from Signal on the primary phone. Do not scan a QR that renders as question marks; use the PNG path printed by the installer instead.
 
 ## Uninstall
 

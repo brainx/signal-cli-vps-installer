@@ -124,6 +124,9 @@ expect_failure "bind rejects shell semicolon" "$INSTALLER" --dry-run --allow-pub
 expect_failure "bind rejects command substitution" "$INSTALLER" --dry-run --allow-public-bind --bind '$(id):8080' --version 0.14.5
 expect_failure "bind rejects quoted host" "$INSTALLER" --dry-run --allow-public-bind --bind '"host":8080' --version 0.14.5
 expect_failure "bind rejects dollar expansion" "$INSTALLER" --dry-run --allow-public-bind --bind '$HOST:8080' --version 0.14.5
+expect_failure "bind rejects invalid IPv4-like host" "$INSTALLER" --dry-run --allow-public-bind --bind 1.2.3.999:8080 --version 0.14.5
+expect_failure "bind rejects invalid hostname label" "$INSTALLER" --dry-run --allow-public-bind --bind bad-.example:8080 --version 0.14.5
+expect_failure "bind rejects invalid bracketed IPv6" "$INSTALLER" --dry-run --allow-public-bind --bind '[::::]:8080' --version 0.14.5
 expect_success "bind accepts private IPv4 with opt-in" "$INSTALLER" --dry-run --allow-public-bind --bind 10.0.0.5:8080 --version 0.14.5
 expect_success "bind accepts hostname with opt-in" "$INSTALLER" --dry-run --allow-public-bind --bind signal.internal:8080 --version 0.14.5
 expect_success "bind accepts IPv6 localhost" "$INSTALLER" --dry-run --bind '[::1]:8080' --version 0.14.5
@@ -134,6 +137,7 @@ expect_output_not_contains "no-fail2ban excludes fail2ban package" "  fail2ban" 
 expect_failure "native mode fails on non-x86 arch" env TEST_UNAME_M=aarch64 "$INSTALLER" --dry-run --install-mode native --version 0.14.5
 expect_success "uninstall dry-run preserves data by default" "$ROOT_DIR/scripts/uninstall.sh" --dry-run
 expect_success "uninstall purge-data dry-run does not prompt" "$ROOT_DIR/scripts/uninstall.sh" --dry-run --purge-data
+expect_output_contains "uninstall dry-run respects install root" "/tmp/test-root/var/lib/signal-cli" env TEST_MODE=true INSTALL_ROOT=/tmp/test-root "$ROOT_DIR/scripts/uninstall.sh" --dry-run --purge-data --purge-binaries --purge-hardening
 expect_success "upgrade dry-run works" env TEST_UNAME_M=x86_64 "$ROOT_DIR/scripts/upgrade-signal-cli.sh" --dry-run --version 0.0.0 --install-mode native --sha256 0000000000000000000000000000000000000000000000000000000000000000
 expect_output_not_contains_text "upgrade dry-run does not prompt for Signal account" "Signal account number" env TEST_UNAME_M=x86_64 "$ROOT_DIR/scripts/upgrade-signal-cli.sh" --dry-run --version 0.0.0 --install-mode native --sha256 0000000000000000000000000000000000000000000000000000000000000000
 expect_output_not_contains_text "upgrade dry-run does not prompt for linked device name" "Linked device name" env TEST_UNAME_M=x86_64 "$ROOT_DIR/scripts/upgrade-signal-cli.sh" --dry-run --version 0.0.0 --install-mode native --sha256 0000000000000000000000000000000000000000000000000000000000000000
@@ -252,6 +256,7 @@ expect_success "link QR renderer uses only Signal link URI" bash -c '
   cat > "$fake_bin/qrencode" <<'\''EOF'\''
 #!/usr/bin/env bash
 set -Eeuo pipefail
+printf "%s\n" "$*" >> "$QR_ARG_LOG"
 output=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -276,6 +281,7 @@ EOF
   chmod +x "$fake_bin/qrencode"
 
   export PATH="$fake_bin:$PATH"
+  export QR_ARG_LOG="$work_dir/qr-args"
   export QR_PAYLOAD_LOG="$work_dir/payloads"
   link_uri="sgnl://linkdevice?uuid=abc123&pub_key=def456"
   {
@@ -287,6 +293,8 @@ EOF
   test "$(wc -l < "$QR_PAYLOAD_LOG" | tr -d " ")" = "2"
   test "$(sort -u "$QR_PAYLOAD_LOG")" = "$link_uri"
   test "$(cat "$work_dir/link.png")" = "$link_uri"
+  grep -Fxq -- "-t ANSI" "$QR_ARG_LOG"
+  ! grep -Fxq -- "-t utf8" "$QR_ARG_LOG"
 ' bash "$ROOT_DIR"
 
 expect_success "fixture rollback switches symlink" bash -c '
@@ -304,6 +312,19 @@ expect_success "fixture rollback switches symlink" bash -c '
 ' bash "$ROOT_DIR"
 
 expect_failure "rollback refuses missing target" env TEST_MODE=true INSTALL_ROOT="$(mktemp -d)" "$ROOT_DIR/scripts/rollback-signal-cli.sh" --no-restart --to-version 9.9.9 --install-mode native
+
+expect_failure "rollback rejects path traversal version" bash -c '
+  set -Eeuo pipefail
+  cd "$1"
+  root="$(mktemp -d)"
+  mkdir -p "$root/opt/signal-cli-native-0.0.0" "$root/tmp/evil" "$root/usr/local/bin"
+  printf "#!/usr/bin/env bash\nprintf fake-version\\\\n\n" > "$root/tmp/evil/signal-cli"
+  chmod +x "$root/tmp/evil/signal-cli"
+  TEST_MODE=true INSTALL_ROOT="$root" scripts/rollback-signal-cli.sh \
+    --no-restart \
+    --to-version "0.0.0/../../tmp/evil" \
+    --install-mode native >/dev/null
+' bash "$ROOT_DIR"
 
 expect_success "sha256 verification accepts correct digest" bash -c '
   set -Eeuo pipefail
@@ -382,6 +403,41 @@ expect_success "systemd unit verifies when systemd-analyze exists" bash -c '
   if command -v systemd-analyze >/dev/null 2>&1; then
     systemd-analyze verify "$rendered"
   fi
+' bash "$ROOT_DIR"
+
+expect_failure "health check fails when daemon is unreachable" bash -c '
+  set -Eeuo pipefail
+  cd "$1"
+  source ./install.sh
+  DRY_RUN=false
+  TEST_MODE=false
+  HTTP_BIND=127.0.0.1:9
+  sleep() { :; }
+  curl() { return 7; }
+  journalctl() { :; }
+  health_check
+' bash "$ROOT_DIR"
+
+expect_failure "ufw refuses when SSH port detection fails" bash -c '
+  set -Eeuo pipefail
+  cd "$1"
+  source ./install.sh
+  DRY_RUN=true
+  TEST_MODE=false
+  ENABLE_UFW=true
+  detected_ssh_ports() { return 1; }
+  configure_ufw
+' bash "$ROOT_DIR"
+
+expect_success "fail2ban uses installer-specific jail file" bash -c '
+  set -Eeuo pipefail
+  cd "$1"
+  root="$(mktemp -d)"
+  mkdir -p "$root/etc/fail2ban/jail.d"
+  printf "custom-policy\n" > "$root/etc/fail2ban/jail.d/sshd.local"
+  TEST_MODE=true INSTALL_ROOT="$root" bash -c "source ./install.sh; configure_fail2ban" >/dev/null
+  test -f "$root/etc/fail2ban/jail.d/99-signal-cli-sshd.local"
+  test "$(cat "$root/etc/fail2ban/jail.d/sshd.local")" = "custom-policy"
 ' bash "$ROOT_DIR"
 
 printf '\nTests passed: %d\n' "$PASS_COUNT"

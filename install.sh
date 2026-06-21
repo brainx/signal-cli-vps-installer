@@ -13,7 +13,7 @@ DATA_DIR="$(root_path /var/lib/signal-cli)"
 CONFIG_FILE="$(root_path /etc/default/signal-cli)"
 WRAPPER_FILE="$(root_path /usr/local/sbin/signal-cli-daemon-start)"
 SERVICE_FILE="$(root_path /etc/systemd/system/signal-cli.service)"
-FAIL2BAN_FILE="$(root_path /etc/fail2ban/jail.d/sshd.local)"
+FAIL2BAN_FILE="$(root_path /etc/fail2ban/jail.d/99-signal-cli-sshd.local)"
 SYSCTL_FILE="$(root_path /etc/sysctl.d/99-signal-cli-server-hardening.conf)"
 SSH_HARDENING_FILE="$(root_path /etc/ssh/sshd_config.d/99-signal-cli-hardening.conf)"
 UNATTENDED_UPGRADES_FILE="$(root_path /etc/apt/apt.conf.d/20auto-upgrades)"
@@ -363,13 +363,51 @@ validate_ipv4_host() {
 
 validate_hostname() {
   local host="$1"
-  [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] || return 1
+  local label
+
+  [[ ${#host} -le 253 ]] || return 1
+  [[ "$host" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
   [[ "$host" != *..* ]] || return 1
+
+  local IFS=.
+  local -a labels
+  read -r -a labels <<<"$host"
+  [[ "${#labels[@]}" -gt 0 ]] || return 1
+
+  for label in "${labels[@]}"; do
+    [[ ${#label} -ge 1 && ${#label} -le 63 ]] || return 1
+    [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || return 1
+  done
 }
 
 validate_bracketed_ipv6() {
   local host="$1"
+  local addr part hextet_count=0 has_double_colon=false
+
   [[ "$host" =~ ^\[[0-9A-Fa-f:.]+\]$ ]] || return 1
+  addr="${host:1:${#host}-2}"
+  [[ -n "$addr" ]] || return 1
+  [[ "$addr" != *:::* ]] || return 1
+
+  if [[ "$addr" == *::* ]]; then
+    has_double_colon=true
+    [[ "$addr" != *::*::* ]] || return 1
+  fi
+
+  local IFS=:
+  local -a parts
+  read -r -a parts <<<"$addr"
+  for part in "${parts[@]}"; do
+    [[ -n "$part" ]] || continue
+    [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    hextet_count=$((hextet_count + 1))
+  done
+
+  if is_true "$has_double_colon"; then
+    ((hextet_count < 8))
+  else
+    ((hextet_count == 8))
+  fi
 }
 
 contains_shell_unsafe_chars() {
@@ -425,6 +463,10 @@ validate_bind() {
     return 0
   fi
 
+  if [[ "$BIND_HOST" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && ! validate_ipv4_host "$BIND_HOST"; then
+    die "Invalid --bind IPv4 host."
+  fi
+
   if ! validate_ipv4_host "$BIND_HOST" && ! validate_hostname "$BIND_HOST" && ! validate_bracketed_ipv6 "$BIND_HOST"; then
     die "Invalid --bind host. Use IPv4, bracketed IPv6, localhost, or a simple hostname."
   fi
@@ -447,6 +489,10 @@ validate_device_name() {
 validate_common_release_inputs() {
   if [[ ! "$INSTALL_MODE" =~ ^(auto|native|jvm)$ ]]; then
     die "Invalid install mode: $INSTALL_MODE"
+  fi
+
+  if [[ -n "$VERSION" ]]; then
+    [[ "$VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && "$VERSION" != *..* ]] || die "Invalid --version. Refusing path separators or traversal."
   fi
 
   if [[ ! "$VERIFY_MODE" =~ ^(auto|sha256|none)$ ]]; then
@@ -907,7 +953,20 @@ create_service_user() {
 detected_ssh_ports() {
   if command -v sshd >/dev/null 2>&1; then
     sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -u
+  else
+    return 1
   fi
+}
+
+load_detected_ssh_ports() {
+  local -n ports_ref="$1"
+  local output
+
+  ports_ref=()
+  output="$(detected_ssh_ports)" || return 1
+  [[ -n "$output" ]] || return 1
+  mapfile -t ports_ref <<<"$output"
+  [[ "${#ports_ref[@]}" -gt 0 ]]
 }
 
 configure_ufw() {
@@ -920,9 +979,8 @@ configure_ufw() {
   fi
 
   local ports=() port
-  mapfile -t ports < <(detected_ssh_ports || true)
-  if [[ "${#ports[@]}" -eq 0 ]]; then
-    ports=(22)
+  if ! load_detected_ssh_ports ports; then
+    die "Could not determine SSH port from sshd. Refusing to enable UFW; fix sshd -T or rerun with --no-ufw."
   fi
 
   log "Configuring UFW."
@@ -959,7 +1017,7 @@ configure_fail2ban() {
   set_stage "fail2ban configuration"
 
   local ports=() ports_csv
-  mapfile -t ports < <(detected_ssh_ports || true)
+  load_detected_ssh_ports ports || true
   if [[ "${#ports[@]}" -eq 0 ]]; then
     ports=(22)
   fi
@@ -1150,7 +1208,7 @@ render_signal_link_qr() {
 
     if [[ -z "$link_uri" && "$line" =~ (sgnl://linkdevice[^[:space:]]+) ]]; then
       link_uri="${BASH_REMATCH[1]}"
-      printf '%s\n' "$link_uri" | qrencode -t utf8
+      printf '%s\n' "$link_uri" | qrencode -t ANSI
       printf '%s\n' "$link_uri" | qrencode -o "$qr_file" --level=H
     fi
   done
@@ -1179,6 +1237,9 @@ link_signal_device() {
   qr_dir="$(mktemp -d)"
   qr_file="$qr_dir/signal-cli-link.png"
   chmod 0700 "$qr_dir"
+
+  log "Stopping any existing signal-cli service before linking."
+  run_cmd maybe_systemctl stop signal-cli || true
 
   log "Starting Signal linked-device provisioning."
   cat <<EOF
@@ -1255,6 +1316,7 @@ health_check() {
   else
     warn "Health check failed. Recent logs:"
     journalctl -u signal-cli -n 80 --no-pager || true
+    return 1
   fi
 }
 

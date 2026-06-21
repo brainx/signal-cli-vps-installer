@@ -66,6 +66,10 @@ target_for_version() {
   esac
 }
 
+validate_rollback_version() {
+  [[ "$ROLLBACK_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && "$ROLLBACK_VERSION" != *..* ]] || die "Invalid --to-version. Refusing path separators or traversal."
+}
+
 main_rollback() {
   trap on_error ERR
 
@@ -74,6 +78,7 @@ main_rollback() {
 
   [[ -n "$ROLLBACK_VERSION" ]] || die "--to-version is required."
   [[ "$INSTALL_MODE" =~ ^(native|jvm)$ ]] || die "--install-mode must be native or jvm."
+  validate_rollback_version
 
   local target
   target="$(target_for_version "$ROLLBACK_VERSION" "$INSTALL_MODE")"

@@ -3,13 +3,20 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SERVICE_NAME="signal-cli"
-DATA_DIR="/var/lib/signal-cli"
-CONFIG_FILE="/etc/default/signal-cli"
-WRAPPER_FILE="/usr/local/sbin/signal-cli-daemon-start"
-SERVICE_FILE="/etc/systemd/system/signal-cli.service"
-FAIL2BAN_FILE="/etc/fail2ban/jail.d/sshd.local"
-SYSCTL_FILE="/etc/sysctl.d/99-signal-cli-server-hardening.conf"
-SSH_HARDENING_FILE="/etc/ssh/sshd_config.d/99-signal-cli-hardening.conf"
+INSTALL_ROOT="${INSTALL_ROOT:-}"
+root_path() {
+  printf '%s%s\n' "$INSTALL_ROOT" "$1"
+}
+
+DATA_DIR="$(root_path /var/lib/signal-cli)"
+CONFIG_FILE="$(root_path /etc/default/signal-cli)"
+WRAPPER_FILE="$(root_path /usr/local/sbin/signal-cli-daemon-start)"
+SERVICE_FILE="$(root_path /etc/systemd/system/signal-cli.service)"
+FAIL2BAN_FILE="$(root_path /etc/fail2ban/jail.d/99-signal-cli-sshd.local)"
+SYSCTL_FILE="$(root_path /etc/sysctl.d/99-signal-cli-server-hardening.conf)"
+SSH_HARDENING_FILE="$(root_path /etc/ssh/sshd_config.d/99-signal-cli-hardening.conf)"
+OPT_DIR="$(root_path /opt)"
+LOCAL_SIGNAL_CLI="$(root_path /usr/local/bin/signal-cli)"
 
 DRY_RUN="${DRY_RUN:-false}"
 PURGE_DATA="false"
@@ -51,6 +58,10 @@ run_cmd() {
     printf '[dry-run]'
     printf ' %q' "$@"
     printf '\n'
+  elif is_true "${TEST_MODE:-false}" && [[ "${1:-}" == "systemctl" ]]; then
+    printf '[test-mode] skip systemctl'
+    printf ' %q' "${@:2}"
+    printf '\n'
   else
     "$@"
   fi
@@ -91,7 +102,7 @@ parse_args() {
 }
 
 require_root() {
-  if is_true "$DRY_RUN"; then
+  if is_true "$DRY_RUN" || is_true "${TEST_MODE:-false}"; then
     return 0
   fi
 
@@ -129,9 +140,9 @@ Uninstall plan:
 
 Preserved by default:
   $DATA_DIR
-  /opt/signal-cli-*
-  /opt/signal-cli-native-*
-  /usr/local/bin/signal-cli
+  $OPT_DIR/signal-cli-*
+  $OPT_DIR/signal-cli-native-*
+  $LOCAL_SIGNAL_CLI
 EOF
 }
 
@@ -159,8 +170,8 @@ main() {
 
   if is_true "$PURGE_BINARIES"; then
     log "Removing signal-cli binaries."
-    run_cmd rm -f /usr/local/bin/signal-cli
-    run_cmd rm -rf /opt/signal-cli-* /opt/signal-cli-native-*
+    run_cmd rm -f "$LOCAL_SIGNAL_CLI"
+    run_cmd rm -rf "$OPT_DIR"/signal-cli-* "$OPT_DIR"/signal-cli-native-*
   fi
 
   if is_true "$PURGE_DATA"; then

@@ -77,11 +77,13 @@ main_upgrade() {
   trap on_error ERR
   trap cleanup EXIT
 
+  local original_args=("$@")
+
   parse_upgrade_args "$@"
   parse_args "${INSTALL_ARGS[@]}"
   RUN_LINK="false"
   SSH_HARDENING="false"
-  require_root "${INSTALL_ARGS[@]}"
+  require_root "${original_args[@]}"
   validate_upgrade_inputs
   choose_install_mode
   preflight_checks

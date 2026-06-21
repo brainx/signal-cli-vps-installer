@@ -2,14 +2,12 @@
 
 ## QR Code Does Not Appear or Scans Wrong
 
-Likely cause: `qrencode` is missing, or signal-cli did not print a `sgnl://linkdevice...` URI before the link session closed. The installer only QR-encodes that URI; status text and errors are not valid QR payloads.
+Likely cause: `qrencode` is missing, signal-cli did not print a `sgnl://linkdevice...` URI before the link session closed, or the terminal is replacing QR block characters with `?`. The installer only QR-encodes the Signal link URI; status text and errors are not valid QR payloads.
 
 Check:
 
 ```bash
 command -v qrencode
-sudo runuser -u signal-cli -- env HOME=/var/lib/signal-cli XDG_DATA_HOME=/var/lib/signal-cli \
-  signal-cli --data-dir /var/lib/signal-cli link -n HomeOps-Signal
 ```
 
 Fix:
@@ -18,7 +16,9 @@ Fix:
 sudo apt-get install -y qrencode
 ```
 
-If the manual link command never prints a `sgnl://linkdevice...` URI, check the VPS clock and outbound connectivity, then rerun linking.
+Do not scan a QR that appears as question marks. Use the installer-generated QR or scan the PNG file path printed by the installer.
+
+If the link command never prints a `sgnl://linkdevice...` URI, check the VPS clock and outbound connectivity, then rerun linking. Do not paste the full URI into tickets or chat logs.
 
 ## Link Command Hangs
 
@@ -27,14 +27,14 @@ Likely cause: the primary phone has not scanned the QR code yet.
 Check:
 
 ```bash
-journalctl -u signal-cli -n 100 --no-pager
+timedatectl status
+curl -I https://chat.signal.org
 ```
 
-Fix: rerun linking and scan from Signal on the primary phone:
+Fix: rerun linking through the installer and scan from Signal on the primary phone:
 
 ```bash
-sudo runuser -u signal-cli -- env HOME=/var/lib/signal-cli XDG_DATA_HOME=/var/lib/signal-cli \
-  signal-cli --data-dir /var/lib/signal-cli link -n HomeOps-Signal
+sudo ./install.sh --account +31612345678 --device-name HomeOps-Signal --version 0.14.5 --sha256 SHA256
 ```
 
 ## Health Check Fails

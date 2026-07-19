@@ -94,6 +94,8 @@ sudo systemctl restart signal-cli
 
 Upgrade only changes the installed binary and symlink. It does not relink the Signal device or remove `/var/lib/signal-cli`.
 The upgrade script is non-interactive apart from sudo/root escalation. It does not ask for the Signal account number, does not relink a device, and does not modify `/var/lib/signal-cli`.
+Replacement artifacts are staged and validated under `/opt` before activation. If restart or health checking fails after activation, the script restores the previous binary and restarts the service; if automatic recovery cannot complete, it preserves the recovery files and prints their location.
+For safe rollback, `/usr/local/bin/signal-cli` must be the installer-managed symlink. Install and upgrade refuse to overwrite a regular file at that path; move a manually installed executable aside before continuing.
 
 Preview:
 

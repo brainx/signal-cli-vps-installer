@@ -105,9 +105,39 @@ file_sha256() {
 make_fixture_archives() {
   NATIVE_FIXTURE_ARCHIVE="$TMP_DIR/signal-cli-0.0.0-Linux-native.tar.gz"
   JVM_FIXTURE_ARCHIVE="$TMP_DIR/signal-cli-0.0.0.tar.gz"
+  BROKEN_NATIVE_FIXTURE_ARCHIVE="$TMP_DIR/signal-cli-0.0.1-Linux-native.tar.gz"
+  REPLACEMENT_NATIVE_FIXTURE_ARCHIVE="$TMP_DIR/replacement-signal-cli-0.0.0-Linux-native.tar.gz"
+  MALFORMED_JVM_FIXTURE_ARCHIVE="$TMP_DIR/malformed-signal-cli-0.0.0.tar.gz"
 
   tar -czf "$NATIVE_FIXTURE_ARCHIVE" -C "$ROOT_DIR/tests/fixtures/native" signal-cli-0.0.0-Linux-native
   tar -czf "$JVM_FIXTURE_ARCHIVE" -C "$ROOT_DIR/tests/fixtures/jvm" signal-cli-0.0.0
+
+  mkdir -p "$TMP_DIR/broken-native/signal-cli-0.0.1-Linux-native"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    'if [[ "${1:-}" == "--version" ]]; then' \
+    '  exit 42' \
+    'fi' \
+    'exit 0' >"$TMP_DIR/broken-native/signal-cli-0.0.1-Linux-native/signal-cli"
+  chmod +x "$TMP_DIR/broken-native/signal-cli-0.0.1-Linux-native/signal-cli"
+  tar -czf "$BROKEN_NATIVE_FIXTURE_ARCHIVE" -C "$TMP_DIR/broken-native" signal-cli-0.0.1-Linux-native
+
+  mkdir -p "$TMP_DIR/replacement-native/signal-cli-0.0.0-Linux-native"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    'if [[ "${1:-}" == "--version" ]]; then' \
+    '  echo "signal-cli 0.0.0 replacement"' \
+    '  exit 0' \
+    'fi' \
+    'exit 0' >"$TMP_DIR/replacement-native/signal-cli-0.0.0-Linux-native/signal-cli"
+  chmod +x "$TMP_DIR/replacement-native/signal-cli-0.0.0-Linux-native/signal-cli"
+  tar -czf "$REPLACEMENT_NATIVE_FIXTURE_ARCHIVE" -C "$TMP_DIR/replacement-native" signal-cli-0.0.0-Linux-native
+
+  mkdir -p "$TMP_DIR/malformed-jvm/unexpected/bin"
+  cp "$ROOT_DIR/tests/fixtures/jvm/signal-cli-0.0.0/bin/signal-cli" "$TMP_DIR/malformed-jvm/unexpected/bin/signal-cli"
+  tar -czf "$MALFORMED_JVM_FIXTURE_ARCHIVE" -C "$TMP_DIR/malformed-jvm" unexpected
 }
 
 make_fixture_archives
@@ -205,6 +235,272 @@ expect_success "fixture upgrade is binary-only and non-interactive" bash -c '
   test -x "$root/opt/signal-cli-native-0.0.0/signal-cli"
   test -L "$root/usr/local/bin/signal-cli"
 ' bash "$ROOT_DIR" "$NATIVE_FIXTURE_ARCHIVE" "$(file_sha256 "$NATIVE_FIXTURE_ARCHIVE")"
+
+expect_success "upgrade refuses a non-symlink active binary" bash -c '
+  set -Eeuo pipefail
+  cd "$1"
+  root="$(mktemp -d)"
+  trap '\''rm -rf "$root"'\'' EXIT
+  active_binary="$root/usr/local/bin/signal-cli"
+  mkdir -p "$(dirname "$active_binary")"
+  cp tests/fixtures/native/signal-cli-0.0.0-Linux-native/signal-cli "$active_binary"
+  chmod +x "$active_binary"
+  output="$root/upgrade-output"
+
+  if TEST_MODE=true TEST_UNAME_M=x86_64 INSTALL_ROOT="$root" scripts/upgrade-signal-cli.sh \
+    --no-restart \
+    --install-mode native \
+    --version 0.0.0 \
+    --artifact-file "$2" \
+    --sha256 "$3" >"$output" 2>&1; then
+    exit 1
+  fi
+
+  grep -Fq "Refusing to replace non-symlink signal-cli executable" "$output"
+  test -f "$active_binary"
+  test ! -L "$active_binary"
+  test "$($active_binary --version)" = "signal-cli 0.0.0 fixture"
+' bash "$ROOT_DIR" "$NATIVE_FIXTURE_ARCHIVE" "$(file_sha256 "$NATIVE_FIXTURE_ARCHIVE")"
+
+expect_success "failed native upgrade keeps previous active binary" bash -c '
+  set -Eeuo pipefail
+  cd "$1"
+  root="$(mktemp -d)"
+  trap '\''rm -rf "$root"'\'' EXIT
+  old_target="$root/opt/signal-cli-native-0.0.0/signal-cli"
+  link="$root/usr/local/bin/signal-cli"
+  mkdir -p "$(dirname "$old_target")" "$(dirname "$link")"
+  cp tests/fixtures/native/signal-cli-0.0.0-Linux-native/signal-cli "$old_target"
+  chmod +x "$old_target"
+  ln -s "$old_target" "$link"
+  output="$root/upgrade-output"
+
+  if TEST_MODE=true TEST_UNAME_M=x86_64 INSTALL_ROOT="$root" scripts/upgrade-signal-cli.sh \
+    --no-restart \
+    --install-mode native \
+    --version 0.0.1 \
+    --artifact-file "$2" \
+    --sha256 "$3" >"$output" 2>&1; then
+    exit 1
+  fi
+
+  grep -Fq "Installer failed during stage '\''signal-cli install'\'' with exit code 42" "$output"
+  test "$(readlink "$link")" = "$old_target"
+  test "$($link --version)" = "signal-cli 0.0.0 fixture"
+' bash "$ROOT_DIR" "$BROKEN_NATIVE_FIXTURE_ARCHIVE" "$(file_sha256 "$BROKEN_NATIVE_FIXTURE_ARCHIVE")"
+
+expect_success "failed upgrade health check restores previous binary" bash -c '
+  set -Eeuo pipefail
+  cd "$1"
+  root="$(mktemp -d)"
+  trap '\''rm -rf "$root"'\'' EXIT
+  old_target="$root/opt/signal-cli-native-previous/signal-cli"
+  link="$root/usr/local/bin/signal-cli"
+  mkdir -p "$(dirname "$old_target")" "$(dirname "$link")"
+  cp tests/fixtures/native/signal-cli-0.0.0-Linux-native/signal-cli "$old_target"
+  chmod +x "$old_target"
+  ln -s "$old_target" "$link"
+  output="$root/upgrade-output"
+
+  set +e
+  TEST_MODE=true TEST_UNAME_M=x86_64 INSTALL_ROOT="$root" bash -c '\''
+    set -Eeuo pipefail
+    cd "$1"
+    artifact="$2"
+    digest="$3"
+    source scripts/upgrade-signal-cli.sh
+    health_check() {
+      set_stage "forced health check failure"
+      expected_target="$INSTALL_ROOT/opt/signal-cli-native-0.0.0/signal-cli"
+      [[ "$(readlink -f "$LOCAL_BIN_DIR/signal-cli")" == "$(readlink -f "$expected_target")" ]] || return 97
+      return 55
+    }
+    journalctl() { :; }
+    main_upgrade \
+      --install-mode native \
+      --version 0.0.0 \
+      --artifact-file "$artifact" \
+      --sha256 "$digest"
+  '\'' bash "$1" "$2" "$3" >"$output" 2>&1
+  upgrade_rc=$?
+  set -e
+
+  test "$upgrade_rc" -eq 55
+  grep -Fq "Installer failed during stage '\''forced health check failure'\'' with exit code 55" "$output"
+  test "$(readlink -f "$link")" = "$(readlink -f "$old_target")"
+  test "$($link --version)" = "signal-cli 0.0.0 fixture"
+' bash "$ROOT_DIR" "$NATIVE_FIXTURE_ARCHIVE" "$(file_sha256 "$NATIVE_FIXTURE_ARCHIVE")"
+
+expect_success "failed same-version upgrade restores previous binary contents" bash -c '
+  set -Eeuo pipefail
+  cd "$1"
+  root="$(mktemp -d)"
+  trap '\''rm -rf "$root"'\'' EXIT
+  old_target="$root/opt/signal-cli-native-0.0.0/signal-cli"
+  link="$root/usr/local/bin/signal-cli"
+  mkdir -p "$(dirname "$old_target")" "$(dirname "$link")"
+  cp tests/fixtures/native/signal-cli-0.0.0-Linux-native/signal-cli "$old_target"
+  chmod +x "$old_target"
+  ln -s "$old_target" "$link"
+  output="$root/upgrade-output"
+
+  set +e
+  TEST_MODE=true TEST_UNAME_M=x86_64 INSTALL_ROOT="$root" bash -c '\''
+    set -Eeuo pipefail
+    cd "$1"
+    artifact="$2"
+    digest="$3"
+    source scripts/upgrade-signal-cli.sh
+    health_check() {
+      set_stage "forced same-version health check failure"
+      [[ "$("$LOCAL_BIN_DIR/signal-cli" --version)" == "signal-cli 0.0.0 replacement" ]] || return 98
+      return 56
+    }
+    journalctl() { :; }
+    main_upgrade \
+      --install-mode native \
+      --version 0.0.0 \
+      --artifact-file "$artifact" \
+      --sha256 "$digest"
+  '\'' bash "$1" "$2" "$3" >"$output" 2>&1
+  upgrade_rc=$?
+  set -e
+
+  test "$upgrade_rc" -eq 56
+  grep -Fq "Installer failed during stage '\''forced same-version health check failure'\'' with exit code 56" "$output"
+  test "$(readlink -f "$link")" = "$(readlink -f "$old_target")"
+  test "$($link --version)" = "signal-cli 0.0.0 fixture"
+' bash "$ROOT_DIR" "$REPLACEMENT_NATIVE_FIXTURE_ARCHIVE" "$(file_sha256 "$REPLACEMENT_NATIVE_FIXTURE_ARCHIVE")"
+
+expect_success "failed direct reinstall restores previous binary contents" bash -c '
+  set -Eeuo pipefail
+  cd "$1"
+  root="$(mktemp -d)"
+  trap '\''rm -rf "$root"'\'' EXIT
+  old_target="$root/opt/signal-cli-native-0.0.0/signal-cli"
+  link="$root/usr/local/bin/signal-cli"
+  mkdir -p "$(dirname "$old_target")" "$(dirname "$link")"
+  cp tests/fixtures/native/signal-cli-0.0.0-Linux-native/signal-cli "$old_target"
+  chmod +x "$old_target"
+  ln -s "$old_target" "$link"
+  output="$root/install-output"
+
+  set +e
+  TEST_MODE=true TEST_UNAME_M=x86_64 INSTALL_ROOT="$root" bash -c '\''
+    set -Eeuo pipefail
+    cd "$1"
+    artifact="$2"
+    digest="$3"
+    source ./install.sh
+    create_service_user() {
+      set_stage "forced direct reinstall failure"
+      [[ "$("$LOCAL_BIN_DIR/signal-cli" --version)" == "signal-cli 0.0.0 replacement" ]] || return 98
+      return 57
+    }
+    journalctl() { :; }
+    main \
+      --no-link \
+      --no-ufw \
+      --no-fail2ban \
+      --no-sysctl-hardening \
+      --no-unattended-upgrades \
+      --no-ssh-hardening \
+      --install-mode native \
+      --version 0.0.0 \
+      --artifact-file "$artifact" \
+      --sha256 "$digest"
+  '\'' bash "$1" "$2" "$3" >"$output" 2>&1
+  install_rc=$?
+  set -e
+
+  test "$install_rc" -eq 57
+  grep -Fq "Installer failed during stage '\''forced direct reinstall failure'\'' with exit code 57" "$output"
+  test "$(readlink -f "$link")" = "$(readlink -f "$old_target")"
+  test "$($link --version)" = "signal-cli 0.0.0 fixture"
+' bash "$ROOT_DIR" "$REPLACEMENT_NATIVE_FIXTURE_ARCHIVE" "$(file_sha256 "$REPLACEMENT_NATIVE_FIXTURE_ARCHIVE")"
+
+expect_success "malformed JVM replacement preserves existing install" bash -c '
+  set -Eeuo pipefail
+  cd "$1"
+  root="$(mktemp -d)"
+  trap '\''rm -rf "$root"'\'' EXIT
+  old_target="$root/opt/signal-cli-0.0.0/bin/signal-cli"
+  link="$root/usr/local/bin/signal-cli"
+  mkdir -p "$(dirname "$old_target")" "$(dirname "$link")"
+  cp tests/fixtures/jvm/signal-cli-0.0.0/bin/signal-cli "$old_target"
+  chmod +x "$old_target"
+  ln -s "$old_target" "$link"
+  output="$root/install-output"
+
+  if TEST_MODE=true INSTALL_ROOT="$root" ./install.sh \
+    --no-link \
+    --no-ufw \
+    --no-fail2ban \
+    --no-sysctl-hardening \
+    --no-unattended-upgrades \
+    --no-ssh-hardening \
+    --install-mode jvm \
+    --version 0.0.0 \
+    --artifact-file "$2" \
+    --sha256 "$3" >"$output" 2>&1; then
+    exit 1
+  fi
+
+  grep -Fq "Could not find JVM signal-cli launcher" "$output"
+  test -x "$old_target"
+  test "$(readlink "$link")" = "$old_target"
+  test "$($link --version)" = "signal-cli 0.0.0 fixture"
+' bash "$ROOT_DIR" "$MALFORMED_JVM_FIXTURE_ARCHIVE" "$(file_sha256 "$MALFORMED_JVM_FIXTURE_ARCHIVE")"
+
+expect_success "failed JVM promotion restores existing install" bash -c '
+  set -Eeuo pipefail
+  cd "$1"
+  root="$(mktemp -d)"
+  trap '\''rm -rf "$root"'\'' EXIT
+  old_target="$root/opt/signal-cli-0.0.0/bin/signal-cli"
+  link="$root/usr/local/bin/signal-cli"
+  fake_bin="$root/fake-bin"
+  mkdir -p "$(dirname "$old_target")" "$(dirname "$link")" "$fake_bin"
+  cp tests/fixtures/jvm/signal-cli-0.0.0/bin/signal-cli "$old_target"
+  chmod +x "$old_target"
+  ln -s "$old_target" "$link"
+
+  real_mv="$(command -v mv)"
+  cat >"$fake_bin/mv" <<'\''EOF'\''
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  */extract/signal-cli-0.0.0 | */.signal-cli-install.*/signal-cli-0.0.0)
+    if [[ "${2:-}" == "$FAIL_MV_DEST" ]]; then
+      exit 73
+    fi
+    ;;
+esac
+exec "$REAL_MV" "$@"
+EOF
+  chmod +x "$fake_bin/mv"
+  output="$root/install-output"
+
+  if PATH="$fake_bin:$PATH" REAL_MV="$real_mv" FAIL_MV_DEST="$root/opt/signal-cli-0.0.0" \
+    TEST_MODE=true INSTALL_ROOT="$root" ./install.sh \
+    --no-link \
+    --no-ufw \
+    --no-fail2ban \
+    --no-sysctl-hardening \
+    --no-unattended-upgrades \
+    --no-ssh-hardening \
+    --install-mode jvm \
+    --version 0.0.0 \
+    --artifact-file "$2" \
+    --sha256 "$3" >"$output" 2>&1; then
+    exit 1
+  fi
+
+  grep -Fq "Installer failed during stage '\''signal-cli install'\'' with exit code 73" "$output"
+  test -x "$old_target"
+  test "$(readlink "$link")" = "$old_target"
+  test "$($link --version)" = "signal-cli 0.0.0 fixture"
+' bash "$ROOT_DIR" "$JVM_FIXTURE_ARCHIVE" "$(file_sha256 "$JVM_FIXTURE_ARCHIVE")"
 
 expect_output_contains "test-mode skips Signal linking" "[test-mode] skip Signal device linking" bash -c '
   set -Eeuo pipefail

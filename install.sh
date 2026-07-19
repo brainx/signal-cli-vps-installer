@@ -47,6 +47,12 @@ SIGNAL_CLI_ASSET=""
 SIGNAL_CLI_URL=""
 SIGNAL_CLI_TMPDIR=""
 SIGNAL_CLI_ARTIFACT=""
+SIGNAL_CLI_STAGING_DIR=""
+SIGNAL_CLI_REPLACED_KIND=""
+SIGNAL_CLI_REPLACED_PATH=""
+SIGNAL_CLI_REPLACED_BACKUP=""
+SIGNAL_CLI_PREVIOUS_TARGET=""
+SIGNAL_CLI_RESTART_ON_RESTORE="false"
 BASE_PACKAGES=()
 BOOTSTRAP_PACKAGES=(ca-certificates curl)
 BIND_HOST=""
@@ -57,6 +63,10 @@ log() { printf '\n[+] %s\n' "$*"; }
 warn() { printf '\n[!] %s\n' "$*" >&2; }
 die() {
   printf '\n[ERROR] %s\n' "$*" >&2
+  if declare -F restore_previous_signal_cli_state >/dev/null 2>&1; then
+    trap - ERR
+    restore_previous_signal_cli_state || true
+  fi
   exit 1
 }
 
@@ -118,6 +128,9 @@ set_stage() {
 
 on_error() {
   local exit_code=$?
+  if [[ $# -gt 0 ]]; then
+    exit_code="$1"
+  fi
   local line_no=${BASH_LINENO[0]:-unknown}
   warn "Installer failed during stage '$CURRENT_STAGE' with exit code $exit_code near line $line_no."
   if ! is_dry_run && command -v journalctl >/dev/null 2>&1; then
@@ -128,9 +141,123 @@ on_error() {
 }
 
 cleanup() {
+  if [[ -n "$SIGNAL_CLI_STAGING_DIR" && -d "$SIGNAL_CLI_STAGING_DIR" ]]; then
+    rm -rf "$SIGNAL_CLI_STAGING_DIR"
+  fi
   if [[ -n "$SIGNAL_CLI_TMPDIR" && -d "$SIGNAL_CLI_TMPDIR" ]]; then
     rm -rf "$SIGNAL_CLI_TMPDIR"
   fi
+}
+
+clear_signal_cli_replacement_state() {
+  SIGNAL_CLI_REPLACED_KIND=""
+  SIGNAL_CLI_REPLACED_PATH=""
+  SIGNAL_CLI_REPLACED_BACKUP=""
+}
+
+preserve_signal_cli_recovery_files() {
+  local recovery_dir="$SIGNAL_CLI_STAGING_DIR"
+  SIGNAL_CLI_STAGING_DIR=""
+  warn "Automatic restore failed. Recovery files remain at $recovery_dir."
+}
+
+restore_replaced_signal_cli_install() {
+  local failed_install restore_target
+
+  [[ -n "$SIGNAL_CLI_REPLACED_KIND" ]] || return 0
+
+  case "$SIGNAL_CLI_REPLACED_KIND" in
+    file)
+      if [[ ! -f "$SIGNAL_CLI_REPLACED_BACKUP" || ! -x "$SIGNAL_CLI_REPLACED_BACKUP" ]]; then
+        warn "Previous native binary backup is unavailable: $SIGNAL_CLI_REPLACED_BACKUP"
+        preserve_signal_cli_recovery_files
+        return 1
+      fi
+
+      restore_target="$SIGNAL_CLI_STAGING_DIR/restored-native-signal-cli"
+      if ! run_cmd install -m 0755 "$SIGNAL_CLI_REPLACED_BACKUP" "$restore_target" ||
+        ! run_cmd mv -f "$restore_target" "$SIGNAL_CLI_REPLACED_PATH"; then
+        preserve_signal_cli_recovery_files
+        return 1
+      fi
+      ;;
+    directory)
+      if [[ ! -d "$SIGNAL_CLI_REPLACED_BACKUP" || -L "$SIGNAL_CLI_REPLACED_BACKUP" ]]; then
+        warn "Previous JVM install backup is unavailable: $SIGNAL_CLI_REPLACED_BACKUP"
+        preserve_signal_cli_recovery_files
+        return 1
+      fi
+
+      failed_install="$SIGNAL_CLI_STAGING_DIR/failed-install"
+      run_cmd rm -rf "$failed_install" || true
+      if [[ -e "$SIGNAL_CLI_REPLACED_PATH" || -L "$SIGNAL_CLI_REPLACED_PATH" ]]; then
+        if ! run_cmd mv "$SIGNAL_CLI_REPLACED_PATH" "$failed_install"; then
+          preserve_signal_cli_recovery_files
+          return 1
+        fi
+      fi
+
+      if ! run_cmd mv "$SIGNAL_CLI_REPLACED_BACKUP" "$SIGNAL_CLI_REPLACED_PATH"; then
+        if [[ -e "$failed_install" || -L "$failed_install" ]]; then
+          run_cmd mv "$failed_install" "$SIGNAL_CLI_REPLACED_PATH" || true
+        fi
+        preserve_signal_cli_recovery_files
+        return 1
+      fi
+      run_cmd rm -rf "$failed_install" || true
+      ;;
+    *)
+      warn "Unknown signal-cli replacement backup kind: $SIGNAL_CLI_REPLACED_KIND"
+      preserve_signal_cli_recovery_files
+      return 1
+      ;;
+  esac
+
+  clear_signal_cli_replacement_state
+}
+
+restore_previous_signal_cli_state() {
+  local current_target restored=false restore_failed=false
+
+  if [[ -n "$SIGNAL_CLI_REPLACED_KIND" ]]; then
+    warn "Failure occurred after replacing an existing install; restoring its previous contents."
+    if restore_replaced_signal_cli_install; then
+      restored=true
+    else
+      restore_failed=true
+    fi
+  fi
+
+  if [[ -n "$SIGNAL_CLI_PREVIOUS_TARGET" ]]; then
+    current_target="$(readlink -f "$LOCAL_BIN_DIR/signal-cli" 2>/dev/null || true)"
+    if [[ "$current_target" != "$SIGNAL_CLI_PREVIOUS_TARGET" ]]; then
+      if [[ ! -x "$SIGNAL_CLI_PREVIOUS_TARGET" ]]; then
+        warn "Could not restore previous binary because it is no longer executable: $SIGNAL_CLI_PREVIOUS_TARGET"
+        restore_failed=true
+      else
+        warn "Restoring previous active binary: $SIGNAL_CLI_PREVIOUS_TARGET"
+        if switch_signal_cli_symlink "$SIGNAL_CLI_PREVIOUS_TARGET"; then
+          restored=true
+        else
+          restore_failed=true
+        fi
+      fi
+    fi
+  fi
+
+  if is_true "$restored" && is_true "$SIGNAL_CLI_RESTART_ON_RESTORE"; then
+    maybe_systemctl restart signal-cli || warn "Previous binary was restored, but restarting signal-cli failed."
+  fi
+
+  ! is_true "$restore_failed"
+}
+
+on_lifecycle_error() {
+  local exit_code=$?
+
+  trap - ERR
+  restore_previous_signal_cli_state || true
+  on_error "$exit_code"
 }
 
 run_cmd() {
@@ -887,32 +1014,76 @@ switch_signal_cli_symlink() {
   run_cmd mv -f "$temp_link" "$link_path"
 }
 
+validate_managed_signal_cli_link() {
+  local link_path="$LOCAL_BIN_DIR/signal-cli"
+
+  if [[ -e "$link_path" && ! -L "$link_path" ]]; then
+    die "Refusing to replace non-symlink signal-cli executable at $link_path. Move it aside, then rerun the installer."
+  fi
+}
+
 install_signal_cli_from_artifact() {
   set_stage "signal-cli install"
-  local extract_dir candidate install_dir target
-  extract_dir="$SIGNAL_CLI_TMPDIR/extract"
-  run_cmd mkdir -p "$extract_dir"
+  local backup_path candidate had_previous=false install_dir previous_dir promote_exit staged_dir staged_target target
+
+  run_cmd install -d -m 0755 "$OPT_DIR"
+  SIGNAL_CLI_STAGING_DIR="$(mktemp -d "$OPT_DIR/.signal-cli-install.XXXXXX")"
+  run_cmd chmod 0700 "$SIGNAL_CLI_STAGING_DIR"
 
   log "Installing signal-cli $RESOLVED_VERSION ($INSTALL_MODE)."
+  run_cmd tar xf "$SIGNAL_CLI_ARTIFACT" -C "$SIGNAL_CLI_STAGING_DIR"
 
   if [[ "$INSTALL_MODE" == "native" ]]; then
-    run_cmd tar xf "$SIGNAL_CLI_ARTIFACT" -C "$extract_dir"
-
-    candidate="$(find "$extract_dir" -type f -name signal-cli -perm -111 | head -n 1 || true)"
+    candidate="$(find "$SIGNAL_CLI_STAGING_DIR" -type f -name signal-cli -perm -111 | head -n 1 || true)"
     [[ -n "$candidate" ]] || die "Could not find native signal-cli binary in release archive."
 
     install_dir="$OPT_DIR/signal-cli-native-${RESOLVED_VERSION}"
     target="$install_dir/signal-cli"
+    staged_target="$SIGNAL_CLI_STAGING_DIR/native-signal-cli"
+    run_cmd install -m 0755 "$candidate" "$staged_target"
+    run_cmd "$staged_target" --version >/dev/null
+
     run_cmd install -d -m 0755 "$install_dir"
-    run_cmd install -m 0755 "$candidate" "$target"
+    if [[ -e "$target" || -L "$target" ]]; then
+      [[ -f "$target" && ! -L "$target" ]] || die "Existing native signal-cli target is not a regular file: $target"
+      backup_path="$SIGNAL_CLI_STAGING_DIR/previous-native-signal-cli"
+      run_cmd install -m 0755 "$target" "$backup_path"
+      SIGNAL_CLI_REPLACED_KIND="file"
+      SIGNAL_CLI_REPLACED_PATH="$target"
+      SIGNAL_CLI_REPLACED_BACKUP="$backup_path"
+    fi
+    run_cmd mv -f "$staged_target" "$target"
     switch_signal_cli_symlink "$target"
   else
     install_dir="$OPT_DIR/signal-cli-${RESOLVED_VERSION}"
+    staged_dir="$SIGNAL_CLI_STAGING_DIR/signal-cli-${RESOLVED_VERSION}"
+    candidate="$staged_dir/bin/signal-cli"
     target="$install_dir/bin/signal-cli"
-    run_cmd install -d -m 0755 "$OPT_DIR"
-    run_cmd rm -rf "$install_dir"
-    run_cmd tar xf "$SIGNAL_CLI_ARTIFACT" -C "$OPT_DIR"
-    [[ -x "$target" ]] || die "Could not find JVM signal-cli launcher after extraction."
+    [[ -x "$candidate" ]] || die "Could not find JVM signal-cli launcher in release archive."
+    run_cmd "$candidate" --version >/dev/null
+
+    previous_dir="$SIGNAL_CLI_STAGING_DIR/previous-install"
+    [[ ! -e "$previous_dir" && ! -L "$previous_dir" ]] || die "Release archive contains a reserved installer path."
+    if [[ -e "$install_dir" || -L "$install_dir" ]]; then
+      run_cmd mv "$install_dir" "$previous_dir"
+      had_previous=true
+      SIGNAL_CLI_REPLACED_KIND="directory"
+      SIGNAL_CLI_REPLACED_PATH="$install_dir"
+      SIGNAL_CLI_REPLACED_BACKUP="$previous_dir"
+    fi
+
+    if run_cmd mv "$staged_dir" "$install_dir"; then
+      :
+    else
+      promote_exit=$?
+      if is_true "$had_previous"; then
+        restore_replaced_signal_cli_install || true
+      else
+        run_cmd rm -rf "$install_dir" || true
+      fi
+      return "$promote_exit"
+    fi
+
     switch_signal_cli_symlink "$target"
   fi
 
@@ -1401,8 +1572,12 @@ EOF
 }
 
 main() {
-  trap on_error ERR
+  trap on_lifecycle_error ERR
   trap cleanup EXIT
+
+  SIGNAL_CLI_PREVIOUS_TARGET=""
+  SIGNAL_CLI_RESTART_ON_RESTORE="false"
+  clear_signal_cli_replacement_state
 
   parse_args "$@"
   require_root "$@"
@@ -1419,6 +1594,9 @@ main() {
     return 0
   fi
 
+  validate_managed_signal_cli_link
+  SIGNAL_CLI_PREVIOUS_TARGET="$(readlink -f "$LOCAL_BIN_DIR/signal-cli" 2>/dev/null || true)"
+
   install_base_packages
   download_signal_cli_artifact
   verify_signal_cli_artifact
@@ -1430,8 +1608,14 @@ main() {
   configure_ssh_hardening
   configure_sysctl_hardening
   configure_unattended_upgrades
+  if [[ -n "$SIGNAL_CLI_PREVIOUS_TARGET" ]] && is_true "$RUN_LINK"; then
+    SIGNAL_CLI_RESTART_ON_RESTORE="true"
+  fi
   link_signal_device
   run_initial_receive
+  if [[ -n "$SIGNAL_CLI_PREVIOUS_TARGET" ]]; then
+    SIGNAL_CLI_RESTART_ON_RESTORE="true"
+  fi
   write_systemd_service
   health_check
   print_summary

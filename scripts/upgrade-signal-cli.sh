@@ -74,10 +74,14 @@ validate_upgrade_inputs() {
 }
 
 main_upgrade() {
-  trap on_error ERR
+  trap on_lifecycle_error ERR
   trap cleanup EXIT
 
   local original_args=("$@")
+
+  SIGNAL_CLI_PREVIOUS_TARGET=""
+  SIGNAL_CLI_RESTART_ON_RESTORE="false"
+  clear_signal_cli_replacement_state
 
   parse_upgrade_args "$@"
   parse_args "${INSTALL_ARGS[@]}"
@@ -96,8 +100,9 @@ main_upgrade() {
     return 0
   fi
 
-  local previous_target new_target
-  previous_target="$(readlink -f "$LOCAL_BIN_DIR/signal-cli" 2>/dev/null || true)"
+  local new_target
+  validate_managed_signal_cli_link
+  SIGNAL_CLI_PREVIOUS_TARGET="$(readlink -f "$LOCAL_BIN_DIR/signal-cli" 2>/dev/null || true)"
 
   download_signal_cli_artifact
   verify_signal_cli_artifact
@@ -106,6 +111,7 @@ main_upgrade() {
   new_target="$(readlink -f "$LOCAL_BIN_DIR/signal-cli" 2>/dev/null || true)"
 
   if ! is_true "$UPGRADE_NO_RESTART"; then
+    SIGNAL_CLI_RESTART_ON_RESTORE="true"
     run_cmd maybe_systemctl restart signal-cli
     health_check
   fi
@@ -113,10 +119,12 @@ main_upgrade() {
   cat <<EOF
 
 Upgrade complete.
-Previous binary: ${previous_target:-unknown}
+Previous binary: ${SIGNAL_CLI_PREVIOUS_TARGET:-unknown}
 New binary:      ${new_target:-unknown}
 Rollback hint:   scripts/rollback-signal-cli.sh --to-version PREVIOUS_VERSION --install-mode $INSTALL_MODE
 EOF
 }
 
-main_upgrade "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main_upgrade "$@"
+fi

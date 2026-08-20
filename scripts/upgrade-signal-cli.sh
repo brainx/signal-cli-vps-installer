@@ -60,8 +60,42 @@ Upgrade plan:
   Checksum URL: ${CHECKSUM_URL:-none}
   Unverified download allowed: $ALLOW_UNVERIFIED_DOWNLOAD
   Restart service: $(if is_true "$UPGRADE_NO_RESTART"; then printf 'false'; else printf 'true'; fi)
+  Health bind: $HTTP_BIND
   Link path: $LOCAL_BIN_DIR/signal-cli
 EOF
+}
+
+print_upgrade_rollback_hint() {
+  local managed_opt_dir previous_dir previous_mode previous_target previous_version
+
+  previous_target="${1:-$SIGNAL_CLI_PREVIOUS_TARGET}"
+
+  managed_opt_dir="$(readlink -f "$OPT_DIR" 2>/dev/null || true)"
+  [[ -n "$managed_opt_dir" ]] || managed_opt_dir="$OPT_DIR"
+
+  case "$previous_target" in
+    "$managed_opt_dir"/signal-cli-native-*/signal-cli)
+      previous_dir="${previous_target%/signal-cli}"
+      previous_mode="native"
+      previous_version="${previous_dir##*/signal-cli-native-}"
+      ;;
+    "$managed_opt_dir"/signal-cli-*/bin/signal-cli)
+      previous_dir="${previous_target%/bin/signal-cli}"
+      previous_mode="jvm"
+      previous_version="${previous_dir##*/signal-cli-}"
+      ;;
+    *)
+      printf 'Rollback hint:   Previous binary is not in a recognized managed layout.\n'
+      return 0
+      ;;
+  esac
+
+  if [[ ! "$previous_version" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ || "$previous_version" == *..* ]]; then
+    printf 'Rollback hint:   Previous binary version could not be derived safely.\n'
+    return 0
+  fi
+
+  printf 'Rollback hint:   scripts/rollback-signal-cli.sh --to-version %s --install-mode %s\n' "$previous_version" "$previous_mode"
 }
 
 validate_upgrade_inputs() {
@@ -75,12 +109,20 @@ validate_upgrade_inputs() {
 
 main_upgrade() {
   trap on_lifecycle_error ERR
+  trap 'on_lifecycle_signal HUP' HUP
+  trap 'on_lifecycle_signal INT' INT
+  trap 'on_lifecycle_signal TERM' TERM
   trap cleanup EXIT
 
   local original_args=("$@")
 
   SIGNAL_CLI_PREVIOUS_TARGET=""
-  SIGNAL_CLI_RESTART_ON_RESTORE="false"
+  SIGNAL_CLI_ACTIVATED_TARGET=""
+  SIGNAL_CLI_RESTORE_ABSENT_LINK="false"
+  SIGNAL_CLI_PRESERVE_STAGING_DIR="false"
+  SIGNAL_CLI_SERVICE_WAS_ACTIVE="false"
+  SIGNAL_CLI_SERVICE_STATE_MUTATED="false"
+  SIGNAL_CLI_TRANSACTION_COMMITTED="false"
   clear_signal_cli_replacement_state
 
   parse_upgrade_args "$@"
@@ -91,18 +133,36 @@ main_upgrade() {
   validate_upgrade_inputs
   choose_install_mode
   preflight_checks
+  if ! is_dry_run; then
+    validate_managed_signal_cli_link
+  fi
   install_bootstrap_packages
   resolve_signal_cli_version
   build_signal_cli_asset_url
-  print_upgrade_plan
 
   if is_dry_run; then
+    if ! is_true "$UPGRADE_NO_RESTART"; then
+      load_installed_http_bind_for_dry_run_plan
+    fi
+    print_upgrade_plan
     return 0
   fi
 
-  local new_target
+  local new_target previous_target_for_summary
+  acquire_lifecycle_lock
   validate_managed_signal_cli_link
-  SIGNAL_CLI_PREVIOUS_TARGET="$(readlink -f "$LOCAL_BIN_DIR/signal-cli" 2>/dev/null || true)"
+  if ! is_true "$UPGRADE_NO_RESTART"; then
+    load_installed_http_bind
+  fi
+  print_upgrade_plan
+  if [[ -L "$LOCAL_BIN_DIR/signal-cli" ]]; then
+    SIGNAL_CLI_PREVIOUS_TARGET="$(readlink -f "$LOCAL_BIN_DIR/signal-cli" 2>/dev/null || true)"
+  else
+    SIGNAL_CLI_RESTORE_ABSENT_LINK="true"
+  fi
+  if ! is_true "$UPGRADE_NO_RESTART"; then
+    capture_signal_cli_service_state
+  fi
 
   download_signal_cli_artifact
   verify_signal_cli_artifact
@@ -111,18 +171,21 @@ main_upgrade() {
   new_target="$(readlink -f "$LOCAL_BIN_DIR/signal-cli" 2>/dev/null || true)"
 
   if ! is_true "$UPGRADE_NO_RESTART"; then
-    SIGNAL_CLI_RESTART_ON_RESTORE="true"
+    SIGNAL_CLI_SERVICE_STATE_MUTATED="true"
     run_cmd maybe_systemctl restart signal-cli
     health_check
   fi
 
+  previous_target_for_summary="$SIGNAL_CLI_PREVIOUS_TARGET"
+  commit_signal_cli_transaction
+
   cat <<EOF
 
 Upgrade complete.
-Previous binary: ${SIGNAL_CLI_PREVIOUS_TARGET:-unknown}
+Previous binary: ${previous_target_for_summary:-unknown}
 New binary:      ${new_target:-unknown}
-Rollback hint:   scripts/rollback-signal-cli.sh --to-version PREVIOUS_VERSION --install-mode $INSTALL_MODE
 EOF
+  print_upgrade_rollback_hint "$previous_target_for_summary"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

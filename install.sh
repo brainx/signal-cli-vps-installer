@@ -19,6 +19,10 @@ SSH_HARDENING_FILE="$(root_path /etc/ssh/sshd_config.d/99-signal-cli-hardening.c
 UNATTENDED_UPGRADES_FILE="$(root_path /etc/apt/apt.conf.d/20auto-upgrades)"
 OPT_DIR="$(root_path /opt)"
 LOCAL_BIN_DIR="$(root_path /usr/local/bin)"
+LIFECYCLE_LOCK_FILE="$(root_path /run/signal-cli-lifecycle.lock)"
+LIFECYCLE_LOCK_FALLBACK_DIR="${LIFECYCLE_LOCK_FILE}.test-mkdir"
+LIFECYCLE_LOCK_FALLBACK_OWNER_FILE="$LIFECYCLE_LOCK_FALLBACK_DIR/owner"
+SIGNAL_CLI_INSTALL_MANIFEST_NAME=".signal-cli-install-manifest"
 
 SIGNAL_ACCOUNT="${SIGNAL_ACCOUNT:-}"
 DEVICE_NAME="${DEVICE_NAME:-}"
@@ -41,6 +45,10 @@ CHECKSUM_URL="${CHECKSUM_URL:-}"
 ALLOW_PUBLIC_BIND="${ALLOW_PUBLIC_BIND:-false}"
 DRY_RUN="${DRY_RUN:-false}"
 TEST_MODE="${TEST_MODE:-false}"
+HEALTH_CHECK_MAX_ATTEMPTS="${HEALTH_CHECK_MAX_ATTEMPTS:-15}"
+HEALTH_CHECK_INTERVAL_SECONDS="${HEALTH_CHECK_INTERVAL_SECONDS:-2}"
+HEALTH_CHECK_CONNECT_TIMEOUT_SECONDS="${HEALTH_CHECK_CONNECT_TIMEOUT_SECONDS:-2}"
+HEALTH_CHECK_REQUEST_TIMEOUT_SECONDS="${HEALTH_CHECK_REQUEST_TIMEOUT_SECONDS:-5}"
 
 RESOLVED_VERSION=""
 SIGNAL_CLI_ASSET=""
@@ -51,10 +59,27 @@ SIGNAL_CLI_STAGING_DIR=""
 SIGNAL_CLI_REPLACED_KIND=""
 SIGNAL_CLI_REPLACED_PATH=""
 SIGNAL_CLI_REPLACED_BACKUP=""
+SIGNAL_CLI_PRESERVE_STAGING_DIR="false"
 SIGNAL_CLI_PREVIOUS_TARGET=""
-SIGNAL_CLI_RESTART_ON_RESTORE="false"
+SIGNAL_CLI_ACTIVATED_TARGET=""
+SIGNAL_CLI_RESTORE_ABSENT_LINK="false"
+SIGNAL_CLI_SERVICE_WAS_ACTIVE="false"
+SIGNAL_CLI_SERVICE_STATE_MUTATED="false"
+SIGNAL_CLI_TEMP_LINK=""
+SIGNAL_CLI_TRANSACTION_COMMITTED="false"
+SSH_HARDENING_TRANSACTION_ACTIVE="false"
+SSH_HARDENING_HAD_PREVIOUS="false"
+SSH_HARDENING_BACKUP_DIR=""
+SSH_HARDENING_BACKUP_FILE=""
+SSH_HARDENING_RELOAD_ATTEMPTED="false"
+SSH_HARDENING_RESTORE_IN_PROGRESS="false"
+LIFECYCLE_LOCK_HELD="false"
+LIFECYCLE_LOCK_BACKEND=""
+LIFECYCLE_LOCK_FD=""
+LIFECYCLE_LOCK_OWNER_PID=""
+PROMPT_TTY_FD=""
 BASE_PACKAGES=()
-BOOTSTRAP_PACKAGES=(ca-certificates curl)
+BOOTSTRAP_PACKAGES=(ca-certificates curl util-linux)
 BIND_HOST=""
 BIND_PORT=""
 CURRENT_STAGE="startup"
@@ -122,6 +147,67 @@ is_dry_run() {
   is_true "$DRY_RUN"
 }
 
+path_owner_uid() {
+  stat -c %u "$1" 2>/dev/null || stat -f %u "$1"
+}
+
+path_mode_bits() {
+  stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"
+}
+
+expected_managed_owner_uid() {
+  if is_true "$TEST_MODE"; then
+    printf '%s\n' "$EUID"
+  else
+    printf '0\n'
+  fi
+}
+
+path_is_not_group_or_world_writable() {
+  local mode
+  mode="$(path_mode_bits "$1")" || return 1
+  [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+  (( (8#$mode & 0022) == 0 ))
+}
+
+open_prompt_tty() {
+  if [[ "$PROMPT_TTY_FD" =~ ^[0-9]+$ ]]; then
+    return 0
+  fi
+
+  PROMPT_TTY_FD=""
+  if { exec {PROMPT_TTY_FD}<>/dev/tty; } 2>/dev/null; then
+    return 0
+  fi
+
+  PROMPT_TTY_FD=""
+  return 1
+}
+
+close_prompt_tty() {
+  if [[ "$PROMPT_TTY_FD" =~ ^[0-9]+$ ]]; then
+    { exec {PROMPT_TTY_FD}>&-; } 2>/dev/null || true
+  fi
+  PROMPT_TTY_FD=""
+}
+
+read_prompt_tty() {
+  local prompt="$1"
+  local result_name="$2"
+  local response=""
+
+  open_prompt_tty || return 1
+  if ! {
+    printf '%s' "$prompt" >&"$PROMPT_TTY_FD" &&
+      IFS= read -r response <&"$PROMPT_TTY_FD"
+  } 2>/dev/null; then
+    close_prompt_tty
+    return 1
+  fi
+
+  printf -v "$result_name" '%s' "$response"
+}
+
 set_stage() {
   CURRENT_STAGE="$1"
 }
@@ -140,13 +226,184 @@ on_error() {
   exit "$exit_code"
 }
 
+ensure_lifecycle_lock_parent() {
+  local lock_parent="$1"
+
+  if [[ -L "$lock_parent" || ( -e "$lock_parent" && ! -d "$lock_parent" ) ]]; then
+    die "Lifecycle lock parent is not a regular directory: $lock_parent"
+  fi
+  if [[ ! -e "$lock_parent" ]]; then
+    run_cmd mkdir -p -m 0755 "$lock_parent"
+  fi
+  [[ -d "$lock_parent" && ! -L "$lock_parent" ]] ||
+    die "Lifecycle lock parent is not a regular directory: $lock_parent"
+}
+
+acquire_lifecycle_lock() {
+  local backend="" expected_owner lock_mode lock_owner lock_parent owner_pid
+
+  if is_dry_run || is_true "$LIFECYCLE_LOCK_HELD"; then
+    return 0
+  fi
+
+  set_stage "lifecycle lock"
+  lock_parent="$(dirname "$LIFECYCLE_LOCK_FILE")"
+  ensure_lifecycle_lock_parent "$lock_parent"
+
+  if [[ "${SIGNAL_CLI_TEST_LOCK_BACKEND:-}" == "mkdir" ]]; then
+    is_true "${TEST_MODE:-false}" || die "The mkdir lifecycle-lock backend is restricted to TEST_MODE."
+    backend="mkdir"
+  elif command -v flock >/dev/null 2>&1; then
+    backend="flock"
+  elif is_true "${TEST_MODE:-false}"; then
+    backend="mkdir"
+    warn "flock is unavailable; using the TEST_MODE-only mkdir lifecycle lock."
+  else
+    die "flock is required for lifecycle locking. Install util-linux and retry."
+  fi
+
+  if [[ "$backend" == "mkdir" ]]; then
+    if ! mkdir -m 0700 "$LIFECYCLE_LOCK_FALLBACK_DIR" 2>/dev/null; then
+      die "Another signal-cli lifecycle operation is already running (lock: $LIFECYCLE_LOCK_FALLBACK_DIR)."
+    fi
+
+    owner_pid="${BASHPID:-$$}"
+    if ! (umask 077 && printf '%s\n' "$owner_pid" >"$LIFECYCLE_LOCK_FALLBACK_OWNER_FILE"); then
+      rmdir "$LIFECYCLE_LOCK_FALLBACK_DIR" 2>/dev/null || true
+      die "Could not initialize the TEST_MODE lifecycle lock."
+    fi
+    LIFECYCLE_LOCK_OWNER_PID="$owner_pid"
+    LIFECYCLE_LOCK_BACKEND="mkdir"
+    LIFECYCLE_LOCK_HELD="true"
+    return 0
+  fi
+
+  if [[ -L "$LIFECYCLE_LOCK_FILE" || ( -e "$LIFECYCLE_LOCK_FILE" && ! -f "$LIFECYCLE_LOCK_FILE" ) ]]; then
+    die "Lifecycle lock path is not a regular file: $LIFECYCLE_LOCK_FILE"
+  fi
+  if [[ ! -e "$LIFECYCLE_LOCK_FILE" ]]; then
+    if ! (umask 077 && set -o noclobber && : >"$LIFECYCLE_LOCK_FILE") 2>/dev/null; then
+      [[ -f "$LIFECYCLE_LOCK_FILE" && ! -L "$LIFECYCLE_LOCK_FILE" ]] ||
+        die "Could not create lifecycle lock file: $LIFECYCLE_LOCK_FILE"
+    fi
+  fi
+
+  [[ -f "$LIFECYCLE_LOCK_FILE" && ! -L "$LIFECYCLE_LOCK_FILE" ]] ||
+    die "Lifecycle lock path is not a regular file: $LIFECYCLE_LOCK_FILE"
+  expected_owner="$(expected_managed_owner_uid)"
+  lock_owner="$(path_owner_uid "$LIFECYCLE_LOCK_FILE")" || die "Could not inspect lifecycle lock ownership."
+  [[ "$lock_owner" == "$expected_owner" ]] || die "Lifecycle lock file has an unexpected owner: $LIFECYCLE_LOCK_FILE"
+  lock_mode="$(path_mode_bits "$LIFECYCLE_LOCK_FILE")" || die "Could not inspect lifecycle lock permissions."
+  [[ "$lock_mode" =~ ^[0-7]+$ ]] || die "Lifecycle lock file has invalid permissions."
+  (( (8#$lock_mode & 0022) == 0 )) || die "Lifecycle lock file must not be group- or world-writable."
+
+  if ! exec {LIFECYCLE_LOCK_FD}<>"$LIFECYCLE_LOCK_FILE"; then
+    LIFECYCLE_LOCK_FD=""
+    die "Could not open lifecycle lock file: $LIFECYCLE_LOCK_FILE"
+  fi
+  if ! flock -n "$LIFECYCLE_LOCK_FD"; then
+    exec {LIFECYCLE_LOCK_FD}>&-
+    LIFECYCLE_LOCK_FD=""
+    die "Another signal-cli lifecycle operation is already running (lock: $LIFECYCLE_LOCK_FILE)."
+  fi
+
+  LIFECYCLE_LOCK_BACKEND="flock"
+  LIFECYCLE_LOCK_HELD="true"
+}
+
+release_lifecycle_lock() {
+  local recorded_owner="" release_failed=false
+
+  is_true "$LIFECYCLE_LOCK_HELD" || return 0
+
+  if [[ "$LIFECYCLE_LOCK_BACKEND" == "flock" ]]; then
+    if [[ "$LIFECYCLE_LOCK_FD" =~ ^[0-9]+$ ]]; then
+      if ! flock -u "$LIFECYCLE_LOCK_FD"; then
+        warn "Could not explicitly unlock lifecycle lock: $LIFECYCLE_LOCK_FILE"
+        release_failed=true
+      fi
+      if ! exec {LIFECYCLE_LOCK_FD}>&-; then
+        warn "Could not close lifecycle lock descriptor: $LIFECYCLE_LOCK_FILE"
+        release_failed=true
+      fi
+    else
+      warn "Lifecycle lock descriptor is unavailable: $LIFECYCLE_LOCK_FILE"
+      release_failed=true
+    fi
+  elif [[ "$LIFECYCLE_LOCK_BACKEND" == "mkdir" ]]; then
+    if [[ -L "$LIFECYCLE_LOCK_FALLBACK_OWNER_FILE" ]]; then
+      warn "Refusing to release lifecycle lock with a symlinked owner marker: $LIFECYCLE_LOCK_FALLBACK_OWNER_FILE"
+      release_failed=true
+    elif [[ -f "$LIFECYCLE_LOCK_FALLBACK_OWNER_FILE" ]]; then
+      recorded_owner="$(<"$LIFECYCLE_LOCK_FALLBACK_OWNER_FILE")"
+      if [[ "$recorded_owner" != "$LIFECYCLE_LOCK_OWNER_PID" ]]; then
+        warn "Lifecycle lock ownership changed; leaving it in place: $LIFECYCLE_LOCK_FALLBACK_DIR"
+        release_failed=true
+      else
+        rm -f -- "$LIFECYCLE_LOCK_FALLBACK_OWNER_FILE"
+      fi
+    fi
+
+    if ! is_true "$release_failed" && [[ -d "$LIFECYCLE_LOCK_FALLBACK_DIR" ]]; then
+      if ! rmdir "$LIFECYCLE_LOCK_FALLBACK_DIR"; then
+        warn "Could not release lifecycle lock: $LIFECYCLE_LOCK_FALLBACK_DIR"
+        release_failed=true
+      fi
+    fi
+  else
+    warn "Lifecycle lock backend state is invalid."
+    release_failed=true
+  fi
+
+  LIFECYCLE_LOCK_HELD="false"
+  LIFECYCLE_LOCK_BACKEND=""
+  LIFECYCLE_LOCK_FD=""
+  LIFECYCLE_LOCK_OWNER_PID=""
+  ! is_true "$release_failed"
+}
+
+signal_cli_staging_dir_is_valid() {
+  [[ -n "$SIGNAL_CLI_STAGING_DIR" && -d "$SIGNAL_CLI_STAGING_DIR" && ! -L "$SIGNAL_CLI_STAGING_DIR" ]] || return 1
+  case "$SIGNAL_CLI_STAGING_DIR" in
+    "$OPT_DIR"/.signal-cli-install.*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 cleanup() {
-  if [[ -n "$SIGNAL_CLI_STAGING_DIR" && -d "$SIGNAL_CLI_STAGING_DIR" ]]; then
-    rm -rf "$SIGNAL_CLI_STAGING_DIR"
+  trap - ERR
+
+  if is_true "$SSH_HARDENING_TRANSACTION_ACTIVE"; then
+    restore_ssh_hardening_transaction || true
+  elif [[ -n "$SSH_HARDENING_BACKUP_DIR" ]]; then
+    remove_ssh_hardening_backup || true
+  fi
+
+  if [[ -n "$SIGNAL_CLI_TEMP_LINK" ]]; then
+    if [[ -L "$SIGNAL_CLI_TEMP_LINK" ]]; then
+      rm -f -- "$SIGNAL_CLI_TEMP_LINK" || warn "Could not remove signal-cli lifecycle temporary link: $SIGNAL_CLI_TEMP_LINK"
+    elif [[ -e "$SIGNAL_CLI_TEMP_LINK" ]]; then
+      warn "Refusing to remove unexpected non-symlink lifecycle temporary path: $SIGNAL_CLI_TEMP_LINK"
+    fi
+    SIGNAL_CLI_TEMP_LINK=""
+  fi
+  if [[ -n "$SIGNAL_CLI_STAGING_DIR" ]]; then
+    if ! signal_cli_staging_dir_is_valid; then
+      warn "Refusing to clean an invalid signal-cli staging directory: $SIGNAL_CLI_STAGING_DIR"
+    elif ! is_true "$SIGNAL_CLI_PRESERVE_STAGING_DIR"; then
+      if rm -rf -- "$SIGNAL_CLI_STAGING_DIR"; then
+        SIGNAL_CLI_STAGING_DIR=""
+      else
+        warn "Could not remove signal-cli staging directory: $SIGNAL_CLI_STAGING_DIR"
+      fi
+    fi
   fi
   if [[ -n "$SIGNAL_CLI_TMPDIR" && -d "$SIGNAL_CLI_TMPDIR" ]]; then
-    rm -rf "$SIGNAL_CLI_TMPDIR"
+    rm -rf -- "$SIGNAL_CLI_TMPDIR" || warn "Could not remove signal-cli download temporary directory: $SIGNAL_CLI_TMPDIR"
   fi
+  release_lifecycle_lock || true
+  close_prompt_tty || true
+  return 0
 }
 
 clear_signal_cli_replacement_state() {
@@ -155,16 +412,48 @@ clear_signal_cli_replacement_state() {
   SIGNAL_CLI_REPLACED_BACKUP=""
 }
 
+commit_signal_cli_transaction() {
+  # This is the transaction's atomic commit point. Recovery checks this flag
+  # before consulting any of the fields cleared below.
+  SIGNAL_CLI_TRANSACTION_COMMITTED="true"
+  clear_signal_cli_replacement_state
+  SIGNAL_CLI_PREVIOUS_TARGET=""
+  SIGNAL_CLI_ACTIVATED_TARGET=""
+  SIGNAL_CLI_RESTORE_ABSENT_LINK="false"
+  SIGNAL_CLI_SERVICE_WAS_ACTIVE="false"
+  SIGNAL_CLI_SERVICE_STATE_MUTATED="false"
+  SIGNAL_CLI_PRESERVE_STAGING_DIR="false"
+}
+
 preserve_signal_cli_recovery_files() {
   local recovery_dir="$SIGNAL_CLI_STAGING_DIR"
-  SIGNAL_CLI_STAGING_DIR=""
-  warn "Automatic restore failed. Recovery files remain at $recovery_dir."
+  if signal_cli_staging_dir_is_valid; then
+    SIGNAL_CLI_PRESERVE_STAGING_DIR="true"
+    warn "Automatic restore failed. Recovery files remain at $recovery_dir."
+  else
+    warn "Automatic restore failed and no valid staging directory is available for recovery."
+  fi
+  clear_signal_cli_replacement_state
 }
 
 restore_replaced_signal_cli_install() {
   local failed_install restore_target
 
   [[ -n "$SIGNAL_CLI_REPLACED_KIND" ]] || return 0
+
+  if ! signal_cli_staging_dir_is_valid; then
+    warn "Cannot restore a replaced signal-cli install without a valid staging directory."
+    preserve_signal_cli_recovery_files
+    return 1
+  fi
+  case "$SIGNAL_CLI_REPLACED_BACKUP" in
+    "$SIGNAL_CLI_STAGING_DIR"/*) ;;
+    *)
+      warn "Refusing replacement recovery from outside the validated staging directory: $SIGNAL_CLI_REPLACED_BACKUP"
+      preserve_signal_cli_recovery_files
+      return 1
+      ;;
+  esac
 
   case "$SIGNAL_CLI_REPLACED_KIND" in
     file)
@@ -183,7 +472,7 @@ restore_replaced_signal_cli_install() {
       ;;
     directory)
       if [[ ! -d "$SIGNAL_CLI_REPLACED_BACKUP" || -L "$SIGNAL_CLI_REPLACED_BACKUP" ]]; then
-        warn "Previous JVM install backup is unavailable: $SIGNAL_CLI_REPLACED_BACKUP"
+        warn "Previous signal-cli install backup is unavailable: $SIGNAL_CLI_REPLACED_BACKUP"
         preserve_signal_cli_recovery_files
         return 1
       fi
@@ -217,13 +506,20 @@ restore_replaced_signal_cli_install() {
 }
 
 restore_previous_signal_cli_state() {
-  local current_target restored=false restore_failed=false
+  is_true "$SIGNAL_CLI_TRANSACTION_COMMITTED" && return 0
+
+  local current_link_target current_target restore_failed=false
+
+  if is_true "$SSH_HARDENING_TRANSACTION_ACTIVE"; then
+    warn "Failure occurred after replacing the SSH hardening policy; restoring its previous state."
+    if ! restore_ssh_hardening_transaction; then
+      restore_failed=true
+    fi
+  fi
 
   if [[ -n "$SIGNAL_CLI_REPLACED_KIND" ]]; then
     warn "Failure occurred after replacing an existing install; restoring its previous contents."
-    if restore_replaced_signal_cli_install; then
-      restored=true
-    else
+    if ! restore_replaced_signal_cli_install; then
       restore_failed=true
     fi
   fi
@@ -236,17 +532,50 @@ restore_previous_signal_cli_state() {
         restore_failed=true
       else
         warn "Restoring previous active binary: $SIGNAL_CLI_PREVIOUS_TARGET"
-        if switch_signal_cli_symlink "$SIGNAL_CLI_PREVIOUS_TARGET"; then
-          restored=true
-        else
+        if ! switch_signal_cli_symlink "$SIGNAL_CLI_PREVIOUS_TARGET"; then
           restore_failed=true
         fi
       fi
     fi
+  elif is_true "$SIGNAL_CLI_RESTORE_ABSENT_LINK"; then
+    if [[ -L "$LOCAL_BIN_DIR/signal-cli" ]]; then
+      current_link_target="$(readlink "$LOCAL_BIN_DIR/signal-cli" 2>/dev/null || true)"
+      if [[ -n "$SIGNAL_CLI_ACTIVATED_TARGET" && "$current_link_target" == "$SIGNAL_CLI_ACTIVATED_TARGET" ]]; then
+        warn "Removing newly activated binary link because no active binary existed before this operation."
+        if run_cmd rm -f "$LOCAL_BIN_DIR/signal-cli"; then
+          SIGNAL_CLI_ACTIVATED_TARGET=""
+          SIGNAL_CLI_RESTORE_ABSENT_LINK="false"
+        else
+          restore_failed=true
+        fi
+      else
+        warn "Refusing to remove an unexpected signal-cli symlink while restoring prior absence."
+        restore_failed=true
+      fi
+    elif [[ -e "$LOCAL_BIN_DIR/signal-cli" ]]; then
+      warn "Refusing to remove an unexpected non-symlink signal-cli executable while restoring prior absence."
+      restore_failed=true
+    else
+      SIGNAL_CLI_RESTORE_ABSENT_LINK="false"
+    fi
   fi
 
-  if is_true "$restored" && is_true "$SIGNAL_CLI_RESTART_ON_RESTORE"; then
-    maybe_systemctl restart signal-cli || warn "Previous binary was restored, but restarting signal-cli failed."
+  if is_true "$SIGNAL_CLI_SERVICE_STATE_MUTATED"; then
+    if is_true "$SIGNAL_CLI_SERVICE_WAS_ACTIVE" && [[ -n "$SIGNAL_CLI_PREVIOUS_TARGET" ]] && ! is_true "$restore_failed"; then
+      if maybe_systemctl restart signal-cli; then
+        SIGNAL_CLI_SERVICE_STATE_MUTATED="false"
+      else
+        warn "Previous binary was restored, but restarting the previously active signal-cli service failed."
+        restore_failed=true
+      fi
+    else
+      if maybe_systemctl stop signal-cli; then
+        SIGNAL_CLI_SERVICE_STATE_MUTATED="false"
+      else
+        warn "Could not restore the prior inactive signal-cli service state."
+        restore_failed=true
+      fi
+    fi
   fi
 
   ! is_true "$restore_failed"
@@ -258,6 +587,22 @@ on_lifecycle_error() {
   trap - ERR
   restore_previous_signal_cli_state || true
   on_error "$exit_code"
+}
+
+on_lifecycle_signal() {
+  local signal="${1:-TERM}" exit_code
+
+  case "$signal" in
+    HUP) exit_code=129 ;;
+    INT) exit_code=130 ;;
+    TERM) exit_code=143 ;;
+    *) exit_code=1 ;;
+  esac
+
+  trap - ERR HUP INT TERM
+  warn "Received $signal during stage '$CURRENT_STAGE'; restoring the previous signal-cli state."
+  restore_previous_signal_cli_state || true
+  exit "$exit_code"
 }
 
 run_cmd() {
@@ -272,6 +617,10 @@ run_cmd() {
 
 maybe_systemctl() {
   if is_true "$TEST_MODE"; then
+    if [[ "${1:-}" == is-active ]]; then
+      printf 'inactive\n'
+      return 3
+    fi
     printf '[test-mode] skip systemctl'
     printf ' %q' "$@"
     printf '\n'
@@ -281,17 +630,82 @@ maybe_systemctl() {
   systemctl "$@"
 }
 
+capture_signal_cli_service_state() {
+  local service_state=""
+
+  SIGNAL_CLI_SERVICE_WAS_ACTIVE="false"
+  service_state="$(maybe_systemctl is-active signal-cli.service 2>&1)" || true
+
+  case "$service_state" in
+    active | activating | reloading | deactivating)
+      SIGNAL_CLI_SERVICE_WAS_ACTIVE="true"
+      ;;
+    inactive | failed | not-found)
+      ;;
+    *)
+      warn "Could not determine the signal-cli service state safely: ${service_state:-no state returned}"
+      return 1
+      ;;
+  esac
+}
+
 write_rendered_file() {
   local target="$1"
-  shift
+  local mode="$2"
+  local owner="$3"
+  local group="$4"
+  local renderer="$5"
+  local render_exit temp_file
+  shift 5
 
-  run_cmd install -d -m 0755 "$(dirname "$target")"
+  run_cmd install -d -m 0755 "$(dirname "$target")" || return $?
 
   if is_dry_run; then
-    printf '[dry-run] write %s\n' "$target"
-  else
-    "$@" >"$target"
+    printf '[dry-run] write %s (mode %s owner %s:%s)\n' "$target" "$mode" "$owner" "$group"
+    return 0
   fi
+
+  [[ ! -L "$target" ]] || die "Refusing to replace symlinked privileged file: $target"
+  [[ ! -e "$target" || -f "$target" ]] || die "Refusing to replace non-regular privileged file: $target"
+
+  temp_file="$(mktemp "$(dirname "$target")/.$(basename "$target").XXXXXX")" || return $?
+  chmod 0600 "$temp_file" || {
+    render_exit=$?
+    rm -f -- "$temp_file" || warn "Could not remove failed rendered-file temporary path: $temp_file"
+    return "$render_exit"
+  }
+
+  "$renderer" "$@" >"$temp_file" || {
+    render_exit=$?
+    rm -f -- "$temp_file" || warn "Could not remove failed rendered-file temporary path: $temp_file"
+    return "$render_exit"
+  }
+  chmod "$mode" "$temp_file" || {
+    render_exit=$?
+    rm -f -- "$temp_file" || warn "Could not remove failed rendered-file temporary path: $temp_file"
+    return "$render_exit"
+  }
+
+  if is_true "$TEST_MODE"; then
+    printf '[test-mode] skip chown %s:%s %s\n' "$owner" "$group" "$temp_file"
+  else
+    chown "$owner:$group" "$temp_file" || {
+      render_exit=$?
+      rm -f -- "$temp_file" || warn "Could not remove failed rendered-file temporary path: $temp_file"
+      return "$render_exit"
+    }
+  fi
+
+  if [[ -L "$target" || ( -e "$target" && ! -f "$target" ) ]]; then
+    rm -f -- "$temp_file" || warn "Could not remove unsafe rendered-file temporary path: $temp_file"
+    die "Refusing to replace unsafe privileged file target: $target"
+  fi
+
+  mv -f "$temp_file" "$target" || {
+    render_exit=$?
+    rm -f -- "$temp_file" || warn "Could not remove failed rendered-file temporary path: $temp_file"
+    return "$render_exit"
+  }
 }
 
 ask_yes_no() {
@@ -305,13 +719,14 @@ ask_yes_no() {
     label="y/N"
   fi
 
-  if [[ ! -r /dev/tty ]]; then
+  if ! open_prompt_tty; then
     [[ "$default" == "y" ]]
     return $?
   fi
 
   while true; do
-    read -r -p "$prompt [$label]: " answer </dev/tty || true
+    answer=""
+    read_prompt_tty "$prompt [$label]: " answer || true
     answer="${answer:-$default}"
     case "${answer,,}" in
       y | yes) return 0 ;;
@@ -515,6 +930,8 @@ validate_bracketed_ipv6() {
   addr="${host:1:${#host}-2}"
   [[ -n "$addr" ]] || return 1
   [[ "$addr" != *:::* ]] || return 1
+  [[ "$addr" != :* || "$addr" == ::* ]] || return 1
+  [[ "$addr" != *: || "$addr" == *:: ]] || return 1
 
   if [[ "$addr" == *::* ]]; then
     has_double_colon=true
@@ -573,8 +990,10 @@ bind_port() {
   return 1
 }
 
-validate_bind() {
-  if ! split_bind "$HTTP_BIND"; then
+validate_bind_syntax() {
+  local bind="$1"
+
+  if ! split_bind "$bind"; then
     die "Invalid --bind. Expected HOST:PORT, for example 127.0.0.1:8080."
   fi
 
@@ -582,11 +1001,11 @@ validate_bind() {
     die "Invalid --bind port. Expected 1-65535."
   fi
 
-  if contains_shell_unsafe_chars "$HTTP_BIND"; then
+  if contains_shell_unsafe_chars "$bind"; then
     die "Invalid --bind. Refusing shell-unsafe characters."
   fi
 
-  if is_local_bind "$HTTP_BIND"; then
+  if is_local_bind "$bind"; then
     return 0
   fi
 
@@ -597,12 +1016,66 @@ validate_bind() {
   if ! validate_ipv4_host "$BIND_HOST" && ! validate_hostname "$BIND_HOST" && ! validate_bracketed_ipv6 "$BIND_HOST"; then
     die "Invalid --bind host. Use IPv4, bracketed IPv6, localhost, or a simple hostname."
   fi
+}
+
+validate_bind() {
+  validate_bind_syntax "$HTTP_BIND"
+
+  if is_local_bind "$HTTP_BIND"; then
+    return 0
+  fi
 
   if ! is_true "$ALLOW_PUBLIC_BIND"; then
     die "Refusing non-localhost bind '$HTTP_BIND'. Use --allow-public-bind only behind VPN, reverse proxy, or authenticated transport."
   fi
 
   warn "Public/non-localhost bind enabled: $HTTP_BIND. Do not expose signal-cli JSON-RPC directly to the internet."
+}
+
+load_installed_http_bind() {
+  local candidate="" line assignment_count=0
+
+  [[ -e "$CONFIG_FILE" || -L "$CONFIG_FILE" ]] || return 0
+  [[ -f "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]] || die "Installed runtime config is not a regular file: $CONFIG_FILE"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == SIGNAL_CLI_HTTP_BIND=* ]]; then
+      assignment_count=$((assignment_count + 1))
+      if [[ "$line" =~ ^SIGNAL_CLI_HTTP_BIND=\"([^\"]+)\"$ ]]; then
+        candidate="${BASH_REMATCH[1]}"
+      else
+        die "Malformed SIGNAL_CLI_HTTP_BIND assignment in $CONFIG_FILE."
+      fi
+    fi
+  done <"$CONFIG_FILE"
+
+  ((assignment_count == 1)) || die "Expected exactly one SIGNAL_CLI_HTTP_BIND assignment in $CONFIG_FILE."
+  validate_bind_syntax "$candidate"
+  HTTP_BIND="$candidate"
+}
+
+load_installed_http_bind_for_dry_run_plan() {
+  local candidate loader_exit
+
+  if [[ ! -f "$CONFIG_FILE" || -L "$CONFIG_FILE" || ! -r "$CONFIG_FILE" ]]; then
+    if [[ -e "$CONFIG_FILE" || -L "$CONFIG_FILE" ]]; then
+      warn "Installed HTTP bind is unavailable for this dry-run preview; using $HTTP_BIND."
+    fi
+    return 0
+  fi
+
+  if candidate="$({
+    if load_installed_http_bind >/dev/null; then
+      printf '%s\n' "$HTTP_BIND"
+    else
+      loader_exit=$?
+      exit "$loader_exit"
+    fi
+  } 2>/dev/null)"; then
+    HTTP_BIND="$candidate"
+  else
+    warn "Installed HTTP bind could not be parsed for this dry-run preview; using $HTTP_BIND."
+  fi
 }
 
 validate_device_name() {
@@ -649,13 +1122,13 @@ validate_inputs() {
     DEVICE_NAME="$(hostname -s 2>/dev/null || hostname)-signal-cli"
   fi
 
-  if [[ -r /dev/tty ]] && ! is_dry_run && ! is_true "$TEST_MODE"; then
+  if ! is_dry_run && ! is_true "$TEST_MODE"; then
     if [[ -z "$SIGNAL_ACCOUNT" ]]; then
-      read -r -p "Signal account number, e.g. +31612345678. Leave blank for multi-account mode: " SIGNAL_ACCOUNT </dev/tty || true
+      read_prompt_tty "Signal account number, e.g. +31612345678. Leave blank for multi-account mode: " SIGNAL_ACCOUNT || true
     fi
 
     local input_device=""
-    read -r -p "Linked device name [$DEVICE_NAME]: " input_device </dev/tty || true
+    read_prompt_tty "Linked device name [$DEVICE_NAME]: " input_device || true
     DEVICE_NAME="${input_device:-$DEVICE_NAME}"
   fi
 
@@ -774,6 +1247,7 @@ install_bootstrap_packages() {
 
   local missing=()
   command -v curl >/dev/null 2>&1 || missing+=(curl)
+  command -v flock >/dev/null 2>&1 || missing+=(util-linux)
 
   if [[ "${#missing[@]}" -eq 0 ]]; then
     return 0
@@ -1009,22 +1483,224 @@ switch_signal_cli_symlink() {
   local link_path="$LOCAL_BIN_DIR/signal-cli"
   local temp_link="$LOCAL_BIN_DIR/signal-cli.new"
 
-  run_cmd install -d -m 0755 "$LOCAL_BIN_DIR"
-  run_cmd ln -sfn "$target" "$temp_link"
-  run_cmd mv -f "$temp_link" "$link_path"
+  run_cmd install -d -m 0755 "$LOCAL_BIN_DIR" || return $?
+  if [[ -e "$temp_link" && ! -L "$temp_link" ]]; then
+    warn "Refusing to use an existing non-symlink signal-cli temporary path: $temp_link"
+    return 1
+  fi
+  SIGNAL_CLI_TEMP_LINK="$temp_link"
+  run_cmd ln -sfn "$target" "$temp_link" || return $?
+  SIGNAL_CLI_ACTIVATED_TARGET="$target"
+  run_cmd mv -f "$temp_link" "$link_path" || return $?
+  SIGNAL_CLI_TEMP_LINK=""
+}
+
+validate_signal_cli_binary_version() {
+  local candidate="$1"
+  local output product reported_version ignored
+
+  output="$("$candidate" --version)" || return $?
+  output="${output%%$'\n'*}"
+  IFS=' ' read -r product reported_version ignored <<<"$output"
+
+  if [[ "$product" != signal-cli || "$reported_version" != "$RESOLVED_VERSION" ]]; then
+    die "signal-cli artifact version does not match requested version $RESOLVED_VERSION."
+  fi
+}
+
+write_signal_cli_install_manifest() {
+  local install_dir="$1" install_mode="$2" install_version="$3" marker marker_tmp
+
+  [[ -d "$install_dir" && ! -L "$install_dir" ]] || die "Cannot write ownership manifest outside a regular install directory: $install_dir"
+  marker="$install_dir/$SIGNAL_CLI_INSTALL_MANIFEST_NAME"
+  if [[ -L "$marker" || ( -e "$marker" && ! -f "$marker" ) ]]; then
+    die "Installer ownership manifest path is not a regular file: $marker"
+  fi
+
+  marker_tmp="$(mktemp "$install_dir/.signal-cli-install-manifest.tmp.XXXXXX")"
+  if ! printf 'signal-cli-install-manifest-v1\nmode=%s\nversion=%s\n' "$install_mode" "$install_version" >"$marker_tmp"; then
+    rm -f "$marker_tmp"
+    die "Could not render installer ownership manifest."
+  fi
+  run_cmd chmod 0444 "$marker_tmp"
+  if ! is_true "$TEST_MODE"; then
+    run_cmd chown root:root "$marker_tmp"
+  fi
+  run_cmd mv -f "$marker_tmp" "$marker"
+}
+
+install_manifest_content_is_exact() {
+  local marker="$1" install_mode="$2" version="$3" actual expected expected_size marker_size
+  expected="$(printf 'signal-cli-install-manifest-v1\nmode=%s\nversion=%s\n' "$install_mode" "$version")"
+  expected_size=$((${#expected} + 1))
+  marker_size="$(wc -c <"$marker")" || return 1
+  marker_size="${marker_size//[[:space:]]/}"
+  [[ "$marker_size" == "$expected_size" ]] || return 1
+  actual="$(<"$marker")" || return 1
+  [[ "$actual" == "$expected" ]]
+}
+
+validate_managed_jvm_tree() {
+  local install_dir="$1" trusted_owner="$2" canonical_install_dir entry resolved_entry
+
+  canonical_install_dir="$(readlink -f "$install_dir" 2>/dev/null)" || return 1
+  [[ -n "$canonical_install_dir" ]] || return 1
+
+  if ! find "$install_dir" -mindepth 1 -print0 | while IFS= read -r -d '' entry; do
+    [[ "$(path_owner_uid "$entry")" == "$trusted_owner" ]] || exit 1
+    if [[ -L "$entry" ]]; then
+      resolved_entry="$(readlink -f "$entry" 2>/dev/null)" || exit 1
+      case "$resolved_entry" in
+        "$canonical_install_dir"/*) ;;
+        *) exit 1 ;;
+      esac
+      [[ -f "$resolved_entry" || -d "$resolved_entry" ]] || exit 1
+    else
+      [[ -f "$entry" || -d "$entry" ]] || exit 1
+      path_is_not_group_or_world_writable "$entry" || exit 1
+    fi
+  done; then
+    return 1
+  fi
+}
+
+validate_managed_signal_cli_target() {
+  local target="$1" expected_mode="${2:-}" expected_version="${3:-}"
+  local canonical_target install_dir install_mode marker marker_mode managed_opt_dir target_version trusted_owner
+  local bin_dir=""
+
+  [[ -d "$OPT_DIR" && ! -L "$OPT_DIR" ]] || return 1
+  managed_opt_dir="$(readlink -f "$OPT_DIR" 2>/dev/null)" || return 1
+  canonical_target="$(readlink -f "$target" 2>/dev/null)" || return 1
+  [[ -n "$managed_opt_dir" && -n "$canonical_target" ]] || return 1
+  [[ -f "$canonical_target" && ! -L "$canonical_target" && -x "$canonical_target" ]] || return 1
+
+  case "$canonical_target" in
+    "$managed_opt_dir"/signal-cli-native-*/signal-cli)
+      install_mode="native"
+      install_dir="${canonical_target%/signal-cli}"
+      target_version="${install_dir##*/signal-cli-native-}"
+      ;;
+    "$managed_opt_dir"/signal-cli-*/bin/signal-cli)
+      install_mode="jvm"
+      install_dir="${canonical_target%/bin/signal-cli}"
+      bin_dir="$install_dir/bin"
+      target_version="${install_dir##*/signal-cli-}"
+      ;;
+    *) return 1 ;;
+  esac
+
+  [[ "$(dirname "$install_dir")" == "$managed_opt_dir" ]] || return 1
+  [[ "$target_version" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && "$target_version" != *..* ]] || return 1
+  [[ -z "$expected_mode" || "$install_mode" == "$expected_mode" ]] || return 1
+  [[ -z "$expected_version" || "$target_version" == "$expected_version" ]] || return 1
+  [[ -d "$install_dir" && ! -L "$install_dir" ]] || return 1
+  if [[ -n "$bin_dir" ]]; then
+    [[ -d "$bin_dir" && ! -L "$bin_dir" ]] || return 1
+  fi
+
+  trusted_owner="$(expected_managed_owner_uid)" || return 1
+  [[ "$(path_owner_uid "$managed_opt_dir")" == "$trusted_owner" ]] || return 1
+  path_is_not_group_or_world_writable "$managed_opt_dir" || return 1
+  [[ "$(path_owner_uid "$install_dir")" == "$trusted_owner" ]] || return 1
+  [[ "$(path_owner_uid "$canonical_target")" == "$trusted_owner" ]] || return 1
+  path_is_not_group_or_world_writable "$install_dir" || return 1
+  path_is_not_group_or_world_writable "$canonical_target" || return 1
+  if [[ -n "$bin_dir" ]]; then
+    [[ "$(path_owner_uid "$bin_dir")" == "$trusted_owner" ]] || return 1
+    path_is_not_group_or_world_writable "$bin_dir" || return 1
+    validate_managed_jvm_tree "$install_dir" "$trusted_owner" || return 1
+  fi
+
+  marker="$install_dir/$SIGNAL_CLI_INSTALL_MANIFEST_NAME"
+  if [[ -e "$marker" || -L "$marker" ]]; then
+    [[ -f "$marker" && ! -L "$marker" ]] || return 1
+    [[ "$(path_owner_uid "$marker")" == "$trusted_owner" ]] || return 1
+    marker_mode="$(path_mode_bits "$marker")" || return 1
+    [[ "$marker_mode" =~ ^[0-7]+$ ]] || return 1
+    ((8#$marker_mode == 0444)) || return 1
+    install_manifest_content_is_exact "$marker" "$install_mode" "$target_version" || return 1
+  fi
 }
 
 validate_managed_signal_cli_link() {
-  local link_path="$LOCAL_BIN_DIR/signal-cli"
+  local link_path="$LOCAL_BIN_DIR/signal-cli" resolved_target
 
-  if [[ -e "$link_path" && ! -L "$link_path" ]]; then
+  if [[ -L "$link_path" ]]; then
+    resolved_target="$(readlink -f "$link_path" 2>/dev/null || true)"
+    validate_managed_signal_cli_target "$resolved_target" ||
+      die "Active signal-cli symlink is not a trusted managed executable: $link_path"
+  elif [[ -e "$link_path" ]]; then
     die "Refusing to replace non-symlink signal-cli executable at $link_path. Move it aside, then rerun the installer."
   fi
 }
 
+validate_existing_native_install_for_replacement() {
+  local install_dir="$1" target="$2" dotglob_was_set=false nullglob_was_set=false entry version
+  local -a entries=()
+
+  [[ ! -L "$install_dir" ]] || die "Existing native install directory is a symlink: $install_dir"
+  [[ -d "$install_dir" ]] || die "Existing native install path is not a directory: $install_dir"
+  [[ -f "$target" && ! -L "$target" && -x "$target" ]] ||
+    die "Existing native install does not contain the expected regular executable: $target"
+  version="${install_dir##*/signal-cli-native-}"
+  validate_managed_signal_cli_target "$target" native "$version" ||
+    die "Existing native install is not trusted for replacement: $install_dir"
+
+  shopt -q dotglob && dotglob_was_set=true
+  shopt -q nullglob && nullglob_was_set=true
+  shopt -s dotglob nullglob
+  entries=("$install_dir"/*)
+  is_true "$dotglob_was_set" || shopt -u dotglob
+  is_true "$nullglob_was_set" || shopt -u nullglob
+
+  for entry in "${entries[@]}"; do
+    case "${entry##*/}" in
+      signal-cli) ;;
+      "$SIGNAL_CLI_INSTALL_MANIFEST_NAME")
+        [[ -f "$entry" && ! -L "$entry" ]] ||
+          die "Existing native installer manifest is not a regular file: $entry"
+        ;;
+      *)
+        die "Refusing to replace native install directory containing an unrelated entry: $entry"
+        ;;
+    esac
+  done
+}
+
+validate_existing_jvm_install_for_replacement() {
+  local install_dir="$1" target="$2" version="$3" expected_owner marker marker_mode
+
+  [[ -d "$install_dir" && ! -L "$install_dir" ]] ||
+    die "Existing JVM install path is not a regular directory: $install_dir"
+  [[ -f "$target" && ! -L "$target" && -x "$target" ]] ||
+    die "Existing JVM install does not contain the expected regular executable: $target"
+  marker="$install_dir/$SIGNAL_CLI_INSTALL_MANIFEST_NAME"
+  [[ -f "$marker" && ! -L "$marker" ]] ||
+    die "Refusing to replace an unmarked or invalid JVM install directory: $install_dir"
+
+  expected_owner="$(expected_managed_owner_uid)"
+  [[ "$(path_owner_uid "$install_dir")" == "$expected_owner" ]] ||
+    die "Existing JVM install directory has an unexpected owner: $install_dir"
+  [[ "$(path_owner_uid "$target")" == "$expected_owner" ]] ||
+    die "Existing JVM executable has an unexpected owner: $target"
+  [[ "$(path_owner_uid "$marker")" == "$expected_owner" ]] ||
+    die "Existing JVM installer manifest has an unexpected owner: $marker"
+  path_is_not_group_or_world_writable "$install_dir" ||
+    die "Existing JVM install directory is group- or world-writable: $install_dir"
+  path_is_not_group_or_world_writable "$target" ||
+    die "Existing JVM executable is group- or world-writable: $target"
+  marker_mode="$(path_mode_bits "$marker")" || die "Could not inspect existing JVM installer manifest permissions."
+  if [[ ! "$marker_mode" =~ ^[0-7]+$ ]] || (( 8#$marker_mode != 0444 )); then
+    die "Existing JVM installer manifest must have mode 0444: $marker"
+  fi
+  install_manifest_content_is_exact "$marker" jvm "$version" ||
+    die "Existing JVM installer manifest does not match mode/version: $marker"
+}
+
 install_signal_cli_from_artifact() {
   set_stage "signal-cli install"
-  local backup_path candidate had_previous=false install_dir previous_dir promote_exit staged_dir staged_target target
+  local candidate had_previous=false install_dir previous_dir promote_exit staged_dir staged_target target
 
   run_cmd install -d -m 0755 "$OPT_DIR"
   SIGNAL_CLI_STAGING_DIR="$(mktemp -d "$OPT_DIR/.signal-cli-install.XXXXXX")"
@@ -1039,37 +1715,71 @@ install_signal_cli_from_artifact() {
 
     install_dir="$OPT_DIR/signal-cli-native-${RESOLVED_VERSION}"
     target="$install_dir/signal-cli"
-    staged_target="$SIGNAL_CLI_STAGING_DIR/native-signal-cli"
+    staged_dir="$SIGNAL_CLI_STAGING_DIR/promoted-install"
+    previous_dir="$SIGNAL_CLI_STAGING_DIR/previous-install"
+    [[ ! -e "$staged_dir" && ! -L "$staged_dir" && ! -e "$previous_dir" && ! -L "$previous_dir" ]] ||
+      die "Release archive contains a reserved installer path."
+    run_cmd install -d -m 0755 "$staged_dir"
+    staged_target="$staged_dir/signal-cli"
     run_cmd install -m 0755 "$candidate" "$staged_target"
-    run_cmd "$staged_target" --version >/dev/null
+    validate_signal_cli_binary_version "$staged_target"
+    write_signal_cli_install_manifest "$staged_dir" native "$RESOLVED_VERSION"
 
-    run_cmd install -d -m 0755 "$install_dir"
-    if [[ -e "$target" || -L "$target" ]]; then
-      [[ -f "$target" && ! -L "$target" ]] || die "Existing native signal-cli target is not a regular file: $target"
-      backup_path="$SIGNAL_CLI_STAGING_DIR/previous-native-signal-cli"
-      run_cmd install -m 0755 "$target" "$backup_path"
-      SIGNAL_CLI_REPLACED_KIND="file"
-      SIGNAL_CLI_REPLACED_PATH="$target"
-      SIGNAL_CLI_REPLACED_BACKUP="$backup_path"
+    if [[ -e "$install_dir" || -L "$install_dir" ]]; then
+      validate_existing_native_install_for_replacement "$install_dir" "$target"
+      SIGNAL_CLI_REPLACED_KIND="directory"
+      SIGNAL_CLI_REPLACED_PATH="$install_dir"
+      SIGNAL_CLI_REPLACED_BACKUP="$previous_dir"
+      if run_cmd mv "$install_dir" "$previous_dir"; then
+        had_previous=true
+      else
+        promote_exit=$?
+        clear_signal_cli_replacement_state
+        return "$promote_exit"
+      fi
     fi
-    run_cmd mv -f "$staged_target" "$target"
+
+    if run_cmd mv "$staged_dir" "$install_dir"; then
+      :
+    else
+      promote_exit=$?
+      if is_true "$had_previous"; then
+        restore_replaced_signal_cli_install || true
+      else
+        run_cmd rm -rf "$install_dir" || true
+      fi
+      return "$promote_exit"
+    fi
+
     switch_signal_cli_symlink "$target"
   else
     install_dir="$OPT_DIR/signal-cli-${RESOLVED_VERSION}"
     staged_dir="$SIGNAL_CLI_STAGING_DIR/signal-cli-${RESOLVED_VERSION}"
     candidate="$staged_dir/bin/signal-cli"
     target="$install_dir/bin/signal-cli"
-    [[ -x "$candidate" ]] || die "Could not find JVM signal-cli launcher in release archive."
-    run_cmd "$candidate" --version >/dev/null
+    [[ -d "$staged_dir" && ! -L "$staged_dir" ]] || die "Could not find JVM signal-cli launcher in a regular install directory in release archive."
+    [[ -f "$candidate" && ! -L "$candidate" && -x "$candidate" ]] || die "Could not find JVM signal-cli launcher in release archive."
+    validate_signal_cli_binary_version "$candidate"
+    run_cmd chmod 0755 "$staged_dir" "$candidate"
+    if ! is_true "$TEST_MODE"; then
+      run_cmd chown -R root:root "$staged_dir"
+    fi
+    write_signal_cli_install_manifest "$staged_dir" jvm "$RESOLVED_VERSION"
 
     previous_dir="$SIGNAL_CLI_STAGING_DIR/previous-install"
     [[ ! -e "$previous_dir" && ! -L "$previous_dir" ]] || die "Release archive contains a reserved installer path."
     if [[ -e "$install_dir" || -L "$install_dir" ]]; then
-      run_cmd mv "$install_dir" "$previous_dir"
-      had_previous=true
+      validate_existing_jvm_install_for_replacement "$install_dir" "$target" "$RESOLVED_VERSION"
       SIGNAL_CLI_REPLACED_KIND="directory"
       SIGNAL_CLI_REPLACED_PATH="$install_dir"
       SIGNAL_CLI_REPLACED_BACKUP="$previous_dir"
+      if run_cmd mv "$install_dir" "$previous_dir"; then
+        had_previous=true
+      else
+        promote_exit=$?
+        clear_signal_cli_replacement_state
+        return "$promote_exit"
+      fi
     fi
 
     if run_cmd mv "$staged_dir" "$install_dir"; then
@@ -1090,6 +1800,37 @@ install_signal_cli_from_artifact() {
   run_cmd "$LOCAL_BIN_DIR/signal-cli" --version
 }
 
+validate_existing_service_group() {
+  local -n group_gid_ref="$1"
+  local group_entry group_name _group_password resolved_gid _group_members
+
+  group_entry="$(getent group "$SERVICE_GROUP")" || die "Could not inspect existing group $SERVICE_GROUP."
+  IFS=: read -r group_name _group_password resolved_gid _group_members <<<"$group_entry"
+  [[ "$group_name" == "$SERVICE_GROUP" && "$resolved_gid" =~ ^[0-9]+$ ]] || die "Existing group $SERVICE_GROUP has an invalid group record."
+  [[ "$resolved_gid" != 0 ]] || die "Existing group $SERVICE_GROUP resolves to privileged GID 0."
+  group_gid_ref="$resolved_gid"
+}
+
+validate_existing_service_identity() {
+  local group_gid=""
+  local passwd_entry account_name _password user_uid user_gid _gecos user_home user_shell
+
+  validate_existing_service_group group_gid
+
+  passwd_entry="$(getent passwd "$SERVICE_USER")" || die "Could not inspect existing user $SERVICE_USER."
+  IFS=: read -r account_name _password user_uid user_gid _gecos user_home user_shell <<<"$passwd_entry"
+  [[ "$account_name" == "$SERVICE_USER" && "$user_uid" =~ ^[0-9]+$ && "$user_gid" =~ ^[0-9]+$ ]] ||
+    die "Existing user $SERVICE_USER has an invalid account record."
+  [[ "$user_uid" != 0 && "$user_gid" != 0 ]] || die "Existing user $SERVICE_USER resolves to a privileged root identity."
+  [[ "$user_gid" == "$group_gid" ]] || die "Existing user $SERVICE_USER does not use $SERVICE_GROUP as its primary group."
+  [[ "$user_home" == "$DATA_DIR" ]] || die "Existing user $SERVICE_USER has unexpected home directory $user_home; expected $DATA_DIR."
+
+  case "$user_shell" in
+    /usr/sbin/nologin | /sbin/nologin | /usr/bin/false | /bin/false) ;;
+    *) die "Existing user $SERVICE_USER is login-enabled; refusing to use it as a service identity." ;;
+  esac
+}
+
 create_service_user() {
   set_stage "service user"
 
@@ -1103,11 +1844,16 @@ create_service_user() {
   nologin_shell="$(command -v nologin || true)"
   nologin_shell="${nologin_shell:-/usr/sbin/nologin}"
 
-  if ! getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
+  if getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
+    local _existing_group_gid=""
+    validate_existing_service_group _existing_group_gid
+  else
     run_cmd groupadd --system "$SERVICE_GROUP"
   fi
 
-  if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
+  if id -u "$SERVICE_USER" >/dev/null 2>&1; then
+    validate_existing_service_identity
+  else
     run_cmd useradd --system \
       --gid "$SERVICE_GROUP" \
       --home-dir "$DATA_DIR" \
@@ -1199,7 +1945,7 @@ configure_fail2ban() {
 
   log "Configuring fail2ban for SSH."
   run_cmd install -d -m 0755 "$(dirname "$FAIL2BAN_FILE")"
-  write_rendered_file "$FAIL2BAN_FILE" render_fail2ban_jail "$ports_csv"
+  write_rendered_file "$FAIL2BAN_FILE" 0644 root root render_fail2ban_jail "$ports_csv"
 
   run_cmd maybe_systemctl enable --now fail2ban
   run_cmd maybe_systemctl restart fail2ban
@@ -1218,7 +1964,152 @@ ClientAliveCountMax 2
 EOF
 }
 
+ssh_hardening_backup_is_valid() {
+  [[ -n "$SSH_HARDENING_BACKUP_DIR" &&
+    -d "$SSH_HARDENING_BACKUP_DIR" &&
+    ! -L "$SSH_HARDENING_BACKUP_DIR" &&
+    "$SSH_HARDENING_BACKUP_FILE" == "$SSH_HARDENING_BACKUP_DIR/ssh-hardening.conf" ]]
+}
+
+remove_ssh_hardening_backup() {
+  [[ -n "$SSH_HARDENING_BACKUP_DIR" ]] || return 0
+  if ! ssh_hardening_backup_is_valid; then
+    warn "Refusing to remove an invalid SSH hardening recovery directory: $SSH_HARDENING_BACKUP_DIR"
+    return 1
+  fi
+  if ! rm -rf -- "$SSH_HARDENING_BACKUP_DIR"; then
+    warn "Could not remove SSH hardening recovery directory: $SSH_HARDENING_BACKUP_DIR"
+    return 1
+  fi
+  SSH_HARDENING_BACKUP_DIR=""
+  SSH_HARDENING_BACKUP_FILE=""
+}
+
+begin_ssh_hardening_transaction() {
+  local backup_dir
+
+  if is_true "$SSH_HARDENING_TRANSACTION_ACTIVE"; then
+    warn "An SSH hardening transaction is already active."
+    return 1
+  fi
+
+  SSH_HARDENING_HAD_PREVIOUS="false"
+  SSH_HARDENING_BACKUP_DIR=""
+  SSH_HARDENING_BACKUP_FILE=""
+  SSH_HARDENING_RELOAD_ATTEMPTED="false"
+  SSH_HARDENING_RESTORE_IN_PROGRESS="false"
+
+  if ! backup_dir="$(mktemp -d)"; then
+    warn "Could not create an SSH hardening recovery directory."
+    return 1
+  fi
+  SSH_HARDENING_BACKUP_DIR="$backup_dir"
+  SSH_HARDENING_BACKUP_FILE="$backup_dir/ssh-hardening.conf"
+  if ! chmod 0700 "$backup_dir"; then
+    warn "Could not secure the SSH hardening recovery directory: $backup_dir"
+    rm -rf -- "$backup_dir" || warn "Could not remove incomplete SSH hardening recovery directory: $backup_dir"
+    SSH_HARDENING_BACKUP_DIR=""
+    SSH_HARDENING_BACKUP_FILE=""
+    return 1
+  fi
+
+  if [[ -f "$SSH_HARDENING_FILE" ]]; then
+    if ! cp -p "$SSH_HARDENING_FILE" "$SSH_HARDENING_BACKUP_FILE"; then
+      warn "Could not back up the existing SSH hardening file."
+      remove_ssh_hardening_backup || true
+      return 1
+    fi
+    SSH_HARDENING_HAD_PREVIOUS="true"
+  fi
+
+  # Arm only after recovery state is complete and before replacing the file.
+  SSH_HARDENING_TRANSACTION_ACTIVE="true"
+}
+
+reload_ssh_service() {
+  run_cmd maybe_systemctl reload ssh ||
+    run_cmd maybe_systemctl reload sshd ||
+    run_cmd maybe_systemctl restart ssh ||
+    run_cmd maybe_systemctl restart sshd
+}
+
+restore_ssh_hardening_transaction() {
+  local restore_temp="" restore_failed=false
+
+  is_true "$SSH_HARDENING_TRANSACTION_ACTIVE" || return 0
+  if is_true "$SSH_HARDENING_RESTORE_IN_PROGRESS"; then
+    warn "SSH hardening restoration is already in progress. Recovery files remain at $SSH_HARDENING_BACKUP_DIR."
+    return 1
+  fi
+  SSH_HARDENING_RESTORE_IN_PROGRESS="true"
+
+  if is_true "$SSH_HARDENING_HAD_PREVIOUS"; then
+    if ! ssh_hardening_backup_is_valid ||
+      [[ ! -f "$SSH_HARDENING_BACKUP_FILE" || -L "$SSH_HARDENING_BACKUP_FILE" ]]; then
+      restore_failed=true
+    elif [[ -L "$SSH_HARDENING_FILE" || ( -e "$SSH_HARDENING_FILE" && ! -f "$SSH_HARDENING_FILE" ) ]]; then
+      warn "Refusing to overwrite an unexpected SSH hardening path during restoration: $SSH_HARDENING_FILE"
+      restore_failed=true
+    elif ! restore_temp="$(mktemp "$(dirname "$SSH_HARDENING_FILE")/.ssh-hardening-restore.XXXXXX")"; then
+      restore_failed=true
+    elif ! cp -p "$SSH_HARDENING_BACKUP_FILE" "$restore_temp"; then
+      restore_failed=true
+    elif ! mv -f "$restore_temp" "$SSH_HARDENING_FILE"; then
+      restore_failed=true
+    else
+      restore_temp=""
+    fi
+  else
+    if [[ -L "$SSH_HARDENING_FILE" || -f "$SSH_HARDENING_FILE" ]]; then
+      if ! rm -f -- "$SSH_HARDENING_FILE"; then
+        restore_failed=true
+      fi
+    elif [[ -e "$SSH_HARDENING_FILE" ]]; then
+      warn "Refusing to remove an unexpected SSH hardening path during restoration: $SSH_HARDENING_FILE"
+      restore_failed=true
+    fi
+  fi
+
+  if [[ -n "$restore_temp" ]]; then
+    rm -f -- "$restore_temp" || warn "Could not remove incomplete SSH hardening restore file: $restore_temp"
+  fi
+
+  if ! is_true "$restore_failed" && is_true "$SSH_HARDENING_RELOAD_ATTEMPTED"; then
+    if ! reload_ssh_service; then
+      warn "The prior SSH policy was restored on disk, but reloading it failed."
+      restore_failed=true
+    fi
+  fi
+
+  SSH_HARDENING_RESTORE_IN_PROGRESS="false"
+  if is_true "$restore_failed"; then
+    warn "SSH hardening restoration is incomplete. Recovery files remain at $SSH_HARDENING_BACKUP_DIR."
+    return 1
+  fi
+
+  # Disarm before removing the backup. A signal after this point can only leak
+  # a harmless recovery copy; it cannot cause a partial second restoration.
+  SSH_HARDENING_TRANSACTION_ACTIVE="false"
+  SSH_HARDENING_HAD_PREVIOUS="false"
+  SSH_HARDENING_RELOAD_ATTEMPTED="false"
+  remove_ssh_hardening_backup || true
+  return 0
+}
+
+commit_ssh_hardening_transaction() {
+  is_true "$SSH_HARDENING_TRANSACTION_ACTIVE" || return 0
+
+  SSH_HARDENING_TRANSACTION_ACTIVE="false"
+  SSH_HARDENING_HAD_PREVIOUS="false"
+  SSH_HARDENING_RELOAD_ATTEMPTED="false"
+  SSH_HARDENING_RESTORE_IN_PROGRESS="false"
+  remove_ssh_hardening_backup || true
+  return 0
+}
+
 configure_ssh_hardening() {
+  local write_exit
+
   is_true "$SSH_HARDENING" || return 0
   set_stage "ssh hardening"
 
@@ -1228,15 +2119,47 @@ configure_ssh_hardening() {
   fi
 
   log "Applying SSH hardening."
-  run_cmd install -d -m 0755 "$(dirname "$SSH_HARDENING_FILE")"
-  write_rendered_file "$SSH_HARDENING_FILE" render_ssh_hardening_config
+  run_cmd install -d -m 0755 "$(dirname "$SSH_HARDENING_FILE")" || return 1
 
-  if ! is_dry_run && ! is_true "$TEST_MODE" && ! sshd -t; then
-    rm -f "$SSH_HARDENING_FILE"
-    die "SSH config test failed. Rolled back SSH hardening file."
+  if ! is_dry_run; then
+    [[ ! -L "$SSH_HARDENING_FILE" ]] || die "Refusing to replace symlinked privileged file: $SSH_HARDENING_FILE"
+    [[ ! -e "$SSH_HARDENING_FILE" || -f "$SSH_HARDENING_FILE" ]] ||
+      die "Refusing to replace non-regular privileged file: $SSH_HARDENING_FILE"
+    begin_ssh_hardening_transaction || die "Could not initialize SSH hardening recovery state."
   fi
 
-  run_cmd maybe_systemctl reload ssh || run_cmd maybe_systemctl reload sshd || run_cmd maybe_systemctl restart ssh || run_cmd maybe_systemctl restart sshd || true
+  if write_rendered_file "$SSH_HARDENING_FILE" 0644 root root render_ssh_hardening_config; then
+    :
+  else
+    write_exit=$?
+    if ! is_dry_run; then
+      restore_ssh_hardening_transaction || true
+    fi
+    return "$write_exit"
+  fi
+
+  if ! is_dry_run && ! is_true "$TEST_MODE" && ! sshd -t; then
+    if ! restore_ssh_hardening_transaction; then
+      die "SSH config test failed and the previous SSH hardening file could not be restored."
+    fi
+    die "SSH config test failed. Restored the previous SSH hardening file state."
+  fi
+
+  if ! is_dry_run; then
+    # Set before the call so a signal after systemctl succeeds but before the
+    # shell observes its return still reapplies the restored prior policy.
+    SSH_HARDENING_RELOAD_ATTEMPTED="true"
+  fi
+  if reload_ssh_service; then
+    if ! is_dry_run; then
+      commit_ssh_hardening_transaction || die "SSH hardening was applied, but its recovery backup could not be removed."
+    fi
+  else
+    if ! is_dry_run && ! restore_ssh_hardening_transaction; then
+      die "Every SSH service reload/restart attempt failed and the previous SSH hardening file could not be restored."
+    fi
+    die "Every SSH service reload/restart attempt failed. Restored the previous SSH hardening file state."
+  fi
 }
 
 render_sysctl_config() {
@@ -1264,7 +2187,7 @@ configure_sysctl_hardening() {
   set_stage "sysctl hardening"
 
   log "Applying conservative sysctl hardening."
-  write_rendered_file "$SYSCTL_FILE" render_sysctl_config
+  write_rendered_file "$SYSCTL_FILE" 0644 root root render_sysctl_config
   if is_dry_run; then
     run_cmd sysctl --system
   elif is_true "$TEST_MODE"; then
@@ -1287,7 +2210,7 @@ configure_unattended_upgrades() {
   set_stage "unattended upgrades"
 
   log "Enabling unattended security upgrades."
-  write_rendered_file "$UNATTENDED_UPGRADES_FILE" render_unattended_upgrades_config
+  write_rendered_file "$UNATTENDED_UPGRADES_FILE" 0644 root root render_unattended_upgrades_config
   run_cmd maybe_systemctl enable --now unattended-upgrades || true
 }
 
@@ -1302,13 +2225,7 @@ EOF
 write_runtime_config() {
   set_stage "runtime config"
   log "Writing signal-cli runtime config."
-  write_rendered_file "$CONFIG_FILE" render_runtime_config
-  if is_true "$TEST_MODE"; then
-    printf '[test-mode] skip chown root:%s %s\n' "$SERVICE_GROUP" "$CONFIG_FILE"
-  else
-    run_cmd chown "root:$SERVICE_GROUP" "$CONFIG_FILE"
-  fi
-  run_cmd chmod 0640 "$CONFIG_FILE"
+  write_rendered_file "$CONFIG_FILE" 0640 root "$SERVICE_GROUP" render_runtime_config
 }
 
 render_wrapper() {
@@ -1409,8 +2326,11 @@ link_signal_device() {
   qr_file="$qr_dir/signal-cli-link.png"
   chmod 0700 "$qr_dir"
 
-  log "Stopping any existing signal-cli service before linking."
-  run_cmd maybe_systemctl stop signal-cli || true
+  if is_true "$SIGNAL_CLI_SERVICE_WAS_ACTIVE"; then
+    log "Stopping the active signal-cli service before linking."
+    SIGNAL_CLI_SERVICE_STATE_MUTATED="true"
+    run_cmd maybe_systemctl stop signal-cli
+  fi
 
   log "Starting Signal linked-device provisioning."
   cat <<EOF
@@ -1453,21 +2373,21 @@ write_systemd_service() {
   set_stage "systemd service"
   log "Writing systemd service."
 
-  write_rendered_file "$WRAPPER_FILE" render_wrapper
-  if is_true "$TEST_MODE"; then
-    printf '[test-mode] skip chown root:root %s\n' "$WRAPPER_FILE"
-  else
-    run_cmd chown root:root "$WRAPPER_FILE"
-  fi
-  run_cmd chmod 0755 "$WRAPPER_FILE"
+  write_rendered_file "$WRAPPER_FILE" 0755 root root render_wrapper
 
-  write_rendered_file "$SERVICE_FILE" render_systemd_service
+  write_rendered_file "$SERVICE_FILE" 0644 root root render_systemd_service
 
   run_cmd maybe_systemctl daemon-reload
+  SIGNAL_CLI_SERVICE_STATE_MUTATED="true"
   run_cmd maybe_systemctl enable --now signal-cli.service
+  if is_true "$SIGNAL_CLI_SERVICE_WAS_ACTIVE" && ! is_true "$RUN_LINK"; then
+    run_cmd maybe_systemctl restart signal-cli.service
+  fi
 }
 
 health_check() {
+  local attempt
+
   set_stage "health check"
   log "Checking signal-cli daemon health."
 
@@ -1481,14 +2401,27 @@ health_check() {
     return 0
   fi
 
-  sleep 2
-  if curl -fsS "http://${HTTP_BIND}/api/v1/check" >/dev/null; then
-    printf '[+] JSON-RPC daemon is reachable at http://%s/api/v1/check\n' "$HTTP_BIND"
-  else
-    warn "Health check failed. Recent logs:"
-    journalctl -u signal-cli -n 80 --no-pager || true
-    return 1
-  fi
+  [[ "$HEALTH_CHECK_MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || die "HEALTH_CHECK_MAX_ATTEMPTS must be a positive integer."
+  [[ "$HEALTH_CHECK_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || die "HEALTH_CHECK_INTERVAL_SECONDS must be a non-negative integer."
+  [[ "$HEALTH_CHECK_CONNECT_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "HEALTH_CHECK_CONNECT_TIMEOUT_SECONDS must be a positive integer."
+  [[ "$HEALTH_CHECK_REQUEST_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "HEALTH_CHECK_REQUEST_TIMEOUT_SECONDS must be a positive integer."
+
+  for ((attempt = 1; attempt <= HEALTH_CHECK_MAX_ATTEMPTS; attempt++)); do
+    if curl -fsS \
+      --connect-timeout "$HEALTH_CHECK_CONNECT_TIMEOUT_SECONDS" \
+      --max-time "$HEALTH_CHECK_REQUEST_TIMEOUT_SECONDS" \
+      "http://${HTTP_BIND}/api/v1/check" >/dev/null; then
+      printf '[+] JSON-RPC daemon is reachable at http://%s/api/v1/check\n' "$HTTP_BIND"
+      return 0
+    fi
+    if ((attempt < HEALTH_CHECK_MAX_ATTEMPTS)); then
+      sleep "$HEALTH_CHECK_INTERVAL_SECONDS"
+    fi
+  done
+
+  warn "Health check failed after $HEALTH_CHECK_MAX_ATTEMPTS attempts. Recent logs:"
+  journalctl -u signal-cli -n 80 --no-pager || true
+  return 1
 }
 
 print_install_plan() {
@@ -1573,10 +2506,19 @@ EOF
 
 main() {
   trap on_lifecycle_error ERR
+  trap 'on_lifecycle_signal HUP' HUP
+  trap 'on_lifecycle_signal INT' INT
+  trap 'on_lifecycle_signal TERM' TERM
   trap cleanup EXIT
 
   SIGNAL_CLI_PREVIOUS_TARGET=""
-  SIGNAL_CLI_RESTART_ON_RESTORE="false"
+  SIGNAL_CLI_ACTIVATED_TARGET=""
+  SIGNAL_CLI_RESTORE_ABSENT_LINK="false"
+  SIGNAL_CLI_PRESERVE_STAGING_DIR="false"
+  SIGNAL_CLI_SERVICE_WAS_ACTIVE="false"
+  SIGNAL_CLI_SERVICE_STATE_MUTATED="false"
+  SIGNAL_CLI_TEMP_LINK=""
+  SIGNAL_CLI_TRANSACTION_COMMITTED="false"
   clear_signal_cli_replacement_state
 
   parse_args "$@"
@@ -1585,6 +2527,9 @@ main() {
   choose_install_mode
   preflight_checks
   build_base_packages
+  if ! is_dry_run; then
+    validate_managed_signal_cli_link
+  fi
   install_bootstrap_packages
   resolve_signal_cli_version
   build_signal_cli_asset_url
@@ -1594,8 +2539,14 @@ main() {
     return 0
   fi
 
+  acquire_lifecycle_lock
   validate_managed_signal_cli_link
-  SIGNAL_CLI_PREVIOUS_TARGET="$(readlink -f "$LOCAL_BIN_DIR/signal-cli" 2>/dev/null || true)"
+  if [[ -L "$LOCAL_BIN_DIR/signal-cli" ]]; then
+    SIGNAL_CLI_PREVIOUS_TARGET="$(readlink -f "$LOCAL_BIN_DIR/signal-cli" 2>/dev/null || true)"
+  else
+    SIGNAL_CLI_RESTORE_ABSENT_LINK="true"
+  fi
+  capture_signal_cli_service_state
 
   install_base_packages
   download_signal_cli_artifact
@@ -1608,16 +2559,11 @@ main() {
   configure_ssh_hardening
   configure_sysctl_hardening
   configure_unattended_upgrades
-  if [[ -n "$SIGNAL_CLI_PREVIOUS_TARGET" ]] && is_true "$RUN_LINK"; then
-    SIGNAL_CLI_RESTART_ON_RESTORE="true"
-  fi
   link_signal_device
   run_initial_receive
-  if [[ -n "$SIGNAL_CLI_PREVIOUS_TARGET" ]]; then
-    SIGNAL_CLI_RESTART_ON_RESTORE="true"
-  fi
   write_systemd_service
   health_check
+  commit_signal_cli_transaction
   print_summary
 }
 

@@ -167,7 +167,7 @@ path_is_not_group_or_world_writable() {
   local mode
   mode="$(path_mode_bits "$1")" || return 1
   [[ "$mode" =~ ^[0-7]+$ ]] || return 1
-  (( (8#$mode & 0022) == 0 ))
+  (((8#$mode & 0022) == 0))
 }
 
 open_prompt_tty() {
@@ -229,7 +229,7 @@ on_error() {
 ensure_lifecycle_lock_parent() {
   local lock_parent="$1"
 
-  if [[ -L "$lock_parent" || ( -e "$lock_parent" && ! -d "$lock_parent" ) ]]; then
+  if [[ -L "$lock_parent" || (-e "$lock_parent" && ! -d "$lock_parent") ]]; then
     die "Lifecycle lock parent is not a regular directory: $lock_parent"
   fi
   if [[ ! -e "$lock_parent" ]]; then
@@ -278,7 +278,7 @@ acquire_lifecycle_lock() {
     return 0
   fi
 
-  if [[ -L "$LIFECYCLE_LOCK_FILE" || ( -e "$LIFECYCLE_LOCK_FILE" && ! -f "$LIFECYCLE_LOCK_FILE" ) ]]; then
+  if [[ -L "$LIFECYCLE_LOCK_FILE" || (-e "$LIFECYCLE_LOCK_FILE" && ! -f "$LIFECYCLE_LOCK_FILE") ]]; then
     die "Lifecycle lock path is not a regular file: $LIFECYCLE_LOCK_FILE"
   fi
   if [[ ! -e "$LIFECYCLE_LOCK_FILE" ]]; then
@@ -295,7 +295,7 @@ acquire_lifecycle_lock() {
   [[ "$lock_owner" == "$expected_owner" ]] || die "Lifecycle lock file has an unexpected owner: $LIFECYCLE_LOCK_FILE"
   lock_mode="$(path_mode_bits "$LIFECYCLE_LOCK_FILE")" || die "Could not inspect lifecycle lock permissions."
   [[ "$lock_mode" =~ ^[0-7]+$ ]] || die "Lifecycle lock file has invalid permissions."
-  (( (8#$lock_mode & 0022) == 0 )) || die "Lifecycle lock file must not be group- or world-writable."
+  (((8#$lock_mode & 0022) == 0)) || die "Lifecycle lock file must not be group- or world-writable."
 
   if ! exec {LIFECYCLE_LOCK_FD}<>"$LIFECYCLE_LOCK_FILE"; then
     LIFECYCLE_LOCK_FD=""
@@ -640,8 +640,7 @@ capture_signal_cli_service_state() {
     active | activating | reloading | deactivating)
       SIGNAL_CLI_SERVICE_WAS_ACTIVE="true"
       ;;
-    inactive | failed | not-found)
-      ;;
+    inactive | failed | not-found) ;;
     *)
       warn "Could not determine the signal-cli service state safely: ${service_state:-no state returned}"
       return 1
@@ -696,7 +695,7 @@ write_rendered_file() {
     }
   fi
 
-  if [[ -L "$target" || ( -e "$target" && ! -f "$target" ) ]]; then
+  if [[ -L "$target" || (-e "$target" && ! -f "$target") ]]; then
     rm -f -- "$temp_file" || warn "Could not remove unsafe rendered-file temporary path: $temp_file"
     die "Refusing to replace unsafe privileged file target: $target"
   fi
@@ -1513,7 +1512,7 @@ write_signal_cli_install_manifest() {
 
   [[ -d "$install_dir" && ! -L "$install_dir" ]] || die "Cannot write ownership manifest outside a regular install directory: $install_dir"
   marker="$install_dir/$SIGNAL_CLI_INSTALL_MANIFEST_NAME"
-  if [[ -L "$marker" || ( -e "$marker" && ! -f "$marker" ) ]]; then
+  if [[ -L "$marker" || (-e "$marker" && ! -f "$marker") ]]; then
     die "Installer ownership manifest path is not a regular file: $marker"
   fi
 
@@ -1691,7 +1690,7 @@ validate_existing_jvm_install_for_replacement() {
   path_is_not_group_or_world_writable "$target" ||
     die "Existing JVM executable is group- or world-writable: $target"
   marker_mode="$(path_mode_bits "$marker")" || die "Could not inspect existing JVM installer manifest permissions."
-  if [[ ! "$marker_mode" =~ ^[0-7]+$ ]] || (( 8#$marker_mode != 0444 )); then
+  if [[ ! "$marker_mode" =~ ^[0-7]+$ ]] || ((8#$marker_mode != 0444)); then
     die "Existing JVM installer manifest must have mode 0444: $marker"
   fi
   install_manifest_content_is_exact "$marker" jvm "$version" ||
@@ -2047,7 +2046,7 @@ restore_ssh_hardening_transaction() {
     if ! ssh_hardening_backup_is_valid ||
       [[ ! -f "$SSH_HARDENING_BACKUP_FILE" || -L "$SSH_HARDENING_BACKUP_FILE" ]]; then
       restore_failed=true
-    elif [[ -L "$SSH_HARDENING_FILE" || ( -e "$SSH_HARDENING_FILE" && ! -f "$SSH_HARDENING_FILE" ) ]]; then
+    elif [[ -L "$SSH_HARDENING_FILE" || (-e "$SSH_HARDENING_FILE" && ! -f "$SSH_HARDENING_FILE") ]]; then
       warn "Refusing to overwrite an unexpected SSH hardening path during restoration: $SSH_HARDENING_FILE"
       restore_failed=true
     elif ! restore_temp="$(mktemp "$(dirname "$SSH_HARDENING_FILE")/.ssh-hardening-restore.XXXXXX")"; then

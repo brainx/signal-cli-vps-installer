@@ -81,7 +81,7 @@ path_is_not_group_or_world_writable() {
   local mode
   mode="$(path_mode_bits "$1")" || return 1
   [[ "$mode" =~ ^[0-7]+$ ]] || return 1
-  (( (8#$mode & 0022) == 0 ))
+  (((8#$mode & 0022) == 0))
 }
 
 run_cmd() {
@@ -101,7 +101,7 @@ run_cmd() {
 ensure_lifecycle_lock_parent() {
   local lock_parent="$1"
 
-  if [[ -L "$lock_parent" || ( -e "$lock_parent" && ! -d "$lock_parent" ) ]]; then
+  if [[ -L "$lock_parent" || (-e "$lock_parent" && ! -d "$lock_parent") ]]; then
     die "Lifecycle lock parent is not a regular directory: $lock_parent"
   fi
   if [[ ! -e "$lock_parent" ]]; then
@@ -149,7 +149,7 @@ acquire_lifecycle_lock() {
     return 0
   fi
 
-  if [[ -L "$LIFECYCLE_LOCK_FILE" || ( -e "$LIFECYCLE_LOCK_FILE" && ! -f "$LIFECYCLE_LOCK_FILE" ) ]]; then
+  if [[ -L "$LIFECYCLE_LOCK_FILE" || (-e "$LIFECYCLE_LOCK_FILE" && ! -f "$LIFECYCLE_LOCK_FILE") ]]; then
     die "Lifecycle lock path is not a regular file: $LIFECYCLE_LOCK_FILE"
   fi
   if [[ ! -e "$LIFECYCLE_LOCK_FILE" ]]; then
@@ -166,7 +166,7 @@ acquire_lifecycle_lock() {
   [[ "$lock_owner" == "$expected_owner" ]] || die "Lifecycle lock file has an unexpected owner: $LIFECYCLE_LOCK_FILE"
   lock_mode="$(path_mode_bits "$LIFECYCLE_LOCK_FILE")" || die "Could not inspect lifecycle lock permissions."
   [[ "$lock_mode" =~ ^[0-7]+$ ]] || die "Lifecycle lock file has invalid permissions."
-  (( (8#$lock_mode & 0022) == 0 )) || die "Lifecycle lock file must not be group- or world-writable."
+  (((8#$lock_mode & 0022) == 0)) || die "Lifecycle lock file must not be group- or world-writable."
 
   if ! exec {LIFECYCLE_LOCK_FD}<>"$LIFECYCLE_LOCK_FILE"; then
     LIFECYCLE_LOCK_FD=""
@@ -393,7 +393,7 @@ is_managed_install_dir() {
   path_is_not_group_or_world_writable "$executable" || return 1
   marker_mode="$(path_mode_bits "$marker")" || return 1
   [[ "$marker_mode" =~ ^[0-7]+$ ]] || return 1
-  (( 8#$marker_mode == 0444 )) || return 1
+  ((8#$marker_mode == 0444)) || return 1
   install_manifest_content_is_exact "$marker" "$install_mode" "$version"
 }
 

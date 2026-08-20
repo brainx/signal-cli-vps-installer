@@ -1497,11 +1497,11 @@ switch_signal_cli_symlink() {
 
 validate_signal_cli_binary_version() {
   local candidate="$1"
-  local output product reported_version ignored
+  local output product reported_version
 
   output="$("$candidate" --version)" || return $?
   output="${output%%$'\n'*}"
-  IFS=' ' read -r product reported_version ignored <<<"$output"
+  IFS=' ' read -r product reported_version _ <<<"$output"
 
   if [[ "$product" != signal-cli || "$reported_version" != "$RESOLVED_VERSION" ]]; then
     die "signal-cli artifact version does not match requested version $RESOLVED_VERSION."
@@ -1801,14 +1801,14 @@ install_signal_cli_from_artifact() {
 }
 
 validate_existing_service_group() {
-  local -n group_gid_ref="$1"
+  local result_name="$1"
   local group_entry group_name _group_password resolved_gid _group_members
 
   group_entry="$(getent group "$SERVICE_GROUP")" || die "Could not inspect existing group $SERVICE_GROUP."
   IFS=: read -r group_name _group_password resolved_gid _group_members <<<"$group_entry"
   [[ "$group_name" == "$SERVICE_GROUP" && "$resolved_gid" =~ ^[0-9]+$ ]] || die "Existing group $SERVICE_GROUP has an invalid group record."
   [[ "$resolved_gid" != 0 ]] || die "Existing group $SERVICE_GROUP resolves to privileged GID 0."
-  group_gid_ref="$resolved_gid"
+  printf -v "$result_name" '%s' "$resolved_gid"
 }
 
 validate_existing_service_identity() {

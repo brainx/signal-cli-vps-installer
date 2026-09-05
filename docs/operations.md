@@ -96,6 +96,7 @@ Upgrade only changes the installed binary and symlink. It does not relink the Si
 The upgrade script is non-interactive apart from sudo/root escalation. It does not ask for the Signal account number, does not relink a device, and does not modify `/var/lib/signal-cli`.
 Replacement artifacts are staged and validated under `/opt` before activation. If restart or health checking fails after activation, the script restores the previous binary and restarts the service; if automatic recovery cannot complete, it preserves the recovery files and prints their location.
 For safe rollback, `/usr/local/bin/signal-cli` must be the installer-managed symlink. Install and upgrade refuse to overwrite a regular file at that path; move a manually installed executable aside before continuing.
+Install, upgrade, rollback, and uninstall operations are serialized with a root-owned lifecycle lock under `/run`. A concurrent lifecycle command exits without changing the active installation.
 
 Preview:
 
@@ -174,5 +175,9 @@ sudo scripts/uninstall.sh --purge-binaries
 sudo scripts/uninstall.sh --purge-hardening
 sudo scripts/uninstall.sh --purge-data --yes
 ```
+
+`--purge-binaries` removes only install directories carrying valid installer ownership metadata and removes the active link only when it points to one of those directories. Unmarked legacy installs, unrelated `/opt/signal-cli-*` paths, and regular files at `/usr/local/bin/signal-cli` are preserved for manual review.
+
+`--purge-hardening` removes the installer-created configuration files. It does not immediately undo policy already loaded by fail2ban or SSH, and current kernel sysctl values can remain until another configuration applies them or the host reboots.
 
 Remove `/var/lib/signal-cli` only after confirming you no longer need the linked-device state.

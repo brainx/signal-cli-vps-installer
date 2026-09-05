@@ -39,7 +39,7 @@ jobs:
       - name: Install test dependencies
         run: |
           apt-get update
-          apt-get install -y bash ca-certificates coreutils findutils grep tar
+          apt-get install -y bash ca-certificates coreutils findutils grep tar util-linux
 
       - name: Run validation tests
         run: tests/run-tests.sh

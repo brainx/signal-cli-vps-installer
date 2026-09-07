@@ -248,6 +248,11 @@ expect_failure "invalid install mode fails" "$INSTALLER" --dry-run --install-mod
 expect_failure "port zero fails" "$INSTALLER" --dry-run --bind 127.0.0.1:0 --version 0.14.5
 expect_failure "port over range fails" "$INSTALLER" --dry-run --bind 127.0.0.1:65536 --version 0.14.5
 expect_failure "non-numeric port fails" "$INSTALLER" --dry-run --bind localhost:abc --version 0.14.5
+expect_success "bind accepts decimal zero-padded port" "$INSTALLER" --dry-run --bind 127.0.0.1:08080 --version 0.14.5
+expect_success "bind accepts padded maximum port" "$INSTALLER" --dry-run --bind 127.0.0.1:00000065535 --version 0.14.5
+expect_failure "bind rejects padded decimal port over range" "$INSTALLER" --dry-run --bind 127.0.0.1:0100000 --version 0.14.5
+expect_failure "bind rejects integer overflow port" "$INSTALLER" --dry-run --bind 127.0.0.1:18446744073709559696 --version 0.14.5
+expect_failure "bind rejects zero-padded zero port" "$INSTALLER" --dry-run --bind 127.0.0.1:00000 --version 0.14.5
 expect_failure "public bind fails without opt-in" "$INSTALLER" --dry-run --bind 0.0.0.0:8080 --version 0.14.5
 expect_success "public bind succeeds with opt-in in dry-run" "$INSTALLER" --dry-run --allow-public-bind --bind 0.0.0.0:8080 --version 0.14.5
 expect_failure "bind rejects shell semicolon" "$INSTALLER" --dry-run --allow-public-bind --bind '127.0.0.1:8080;id' --version 0.14.5
@@ -255,6 +260,8 @@ expect_failure "bind rejects command substitution" "$INSTALLER" --dry-run --allo
 expect_failure "bind rejects quoted host" "$INSTALLER" --dry-run --allow-public-bind --bind '"host":8080' --version 0.14.5
 expect_failure "bind rejects dollar expansion" "$INSTALLER" --dry-run --allow-public-bind --bind '$HOST:8080' --version 0.14.5
 expect_failure "bind rejects invalid IPv4-like host" "$INSTALLER" --dry-run --allow-public-bind --bind 1.2.3.999:8080 --version 0.14.5
+expect_failure "bind rejects ambiguous IPv4 octet" "$INSTALLER" --dry-run --allow-public-bind --bind 010.0.0.1:8080 --version 0.14.5
+expect_failure "bind rejects IPv4 octet with invalid octal digits" "$INSTALLER" --dry-run --allow-public-bind --bind 099.0.0.1:8080 --version 0.14.5
 expect_failure "bind rejects invalid hostname label" "$INSTALLER" --dry-run --allow-public-bind --bind bad-.example:8080 --version 0.14.5
 expect_failure "bind rejects invalid bracketed IPv6" "$INSTALLER" --dry-run --allow-public-bind --bind '[::::]:8080' --version 0.14.5
 expect_failure "bind rejects leading single-colon IPv6" "$INSTALLER" --dry-run --allow-public-bind --bind '[:1:2:3:4:5:6:7:8]:8080' --version 0.14.5
@@ -3309,6 +3316,26 @@ expect_success "every health request has finite connection and response timeouts
     $0 == "--max-time" { getline; request = $0 }
     END { exit !(connect == 3 && request == 7) }
   '\'' "$args_file"
+' bash "$ROOT_DIR"
+
+expect_success "wildcard health probes use loopback without proxies or URL globbing" bash -c '
+  set -Eeuo pipefail
+  cd "$1"
+  source ./install.sh
+  DRY_RUN=false
+  TEST_MODE=false
+  HEALTH_CHECK_MAX_ATTEMPTS=1
+  curl() {
+    [[ "$1" == --globoff && "$2" == --noproxy && "$3" == "*" ]] || return 1
+    test "${!#}" = "$expected_url"
+  }
+  journalctl() { :; }
+  HTTP_BIND=0.0.0.0:9090
+  expected_url=http://127.0.0.1:9090/api/v1/check
+  health_check
+  HTTP_BIND="[::]:9090"
+  expected_url="http://[::1]:9090/api/v1/check"
+  health_check
 ' bash "$ROOT_DIR"
 
 expect_failure "health check fails when daemon is unreachable" bash -c '

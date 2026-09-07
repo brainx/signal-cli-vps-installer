@@ -77,6 +77,8 @@ The data directory contains linked-device state and should be treated as sensiti
 curl -i http://127.0.0.1:8080/api/v1/check
 ```
 
+Automated health checks bypass HTTP proxies and probe loopback when the configured listener uses `0.0.0.0` or `[::]`.
+
 If the check fails:
 
 ```bash

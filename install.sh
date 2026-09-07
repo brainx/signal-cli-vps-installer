@@ -862,8 +862,10 @@ require_root() {
 
 validate_port() {
   local port="$1"
-  [[ "$port" =~ ^[0-9]+$ ]] || return 1
-  ((port >= 1 && port <= 65535))
+  # Bound significant digits before arithmetic, and interpret padding as decimal.
+  [[ "$port" =~ ^0*([0-9]{1,5})$ ]] || return 1
+  port="${BASH_REMATCH[1]}"
+  ((10#$port >= 1 && 10#$port <= 65535))
 }
 
 split_bind() {
@@ -898,7 +900,9 @@ validate_ipv4_host() {
 
   for part in "${parts[@]}"; do
     [[ "$part" =~ ^[0-9]+$ ]] || return 1
-    ((part >= 0 && part <= 255)) || return 1
+    # Different network clients interpret zero-prefixed octets differently.
+    [[ "$part" == 0 || "$part" != 0* ]] || return 1
+    ((10#$part <= 255)) || return 1
   done
 }
 
@@ -2385,18 +2389,25 @@ write_systemd_service() {
 }
 
 health_check() {
-  local attempt
+  local attempt health_bind="$HTTP_BIND"
 
   set_stage "health check"
   log "Checking signal-cli daemon health."
 
+  # Wildcard addresses describe listeners; probe their corresponding loopback endpoint.
+  split_bind "$HTTP_BIND" || die "Invalid health-check bind address."
+  case "$BIND_HOST" in
+    0.0.0.0) health_bind="127.0.0.1:$BIND_PORT" ;;
+    '[::]') health_bind="[::1]:$BIND_PORT" ;;
+  esac
+
   if is_dry_run; then
-    printf '[dry-run] curl -fsS http://%s/api/v1/check\n' "$HTTP_BIND"
+    printf '[dry-run] curl -fsS http://%s/api/v1/check\n' "$health_bind"
     return 0
   fi
 
   if is_true "$TEST_MODE"; then
-    printf '[test-mode] skip health check http://%s/api/v1/check\n' "$HTTP_BIND"
+    printf '[test-mode] skip health check http://%s/api/v1/check\n' "$health_bind"
     return 0
   fi
 
@@ -2406,11 +2417,11 @@ health_check() {
   [[ "$HEALTH_CHECK_REQUEST_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "HEALTH_CHECK_REQUEST_TIMEOUT_SECONDS must be a positive integer."
 
   for ((attempt = 1; attempt <= HEALTH_CHECK_MAX_ATTEMPTS; attempt++)); do
-    if curl -fsS \
+    if curl --globoff --noproxy '*' -fsS \
       --connect-timeout "$HEALTH_CHECK_CONNECT_TIMEOUT_SECONDS" \
       --max-time "$HEALTH_CHECK_REQUEST_TIMEOUT_SECONDS" \
-      "http://${HTTP_BIND}/api/v1/check" >/dev/null; then
-      printf '[+] JSON-RPC daemon is reachable at http://%s/api/v1/check\n' "$HTTP_BIND"
+      "http://${health_bind}/api/v1/check" >/dev/null; then
+      printf '[+] JSON-RPC daemon is reachable at http://%s/api/v1/check\n' "$health_bind"
       return 0
     fi
     if ((attempt < HEALTH_CHECK_MAX_ATTEMPTS)); then

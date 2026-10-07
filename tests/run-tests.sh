@@ -2613,6 +2613,88 @@ expect_output_contains "test-mode skips initial receive" "[test-mode] skip initi
     --sha256 "$digest"
 ' bash "$ROOT_DIR" "$NATIVE_FIXTURE_ARCHIVE" "$(file_sha256 "$NATIVE_FIXTURE_ARCHIVE")"
 
+expect_success "initial receive skips a no-link reinstall with an active daemon" bash -c '
+  set -Eeuo pipefail
+  cd "$1"
+  source ./install.sh
+  work_dir="$(mktemp -d)"
+  trap '\''rm -rf "$work_dir"'\'' EXIT
+  TEST_MODE=false
+  DRY_RUN=false
+  RUN_LINK=false
+  SIGNAL_ACCOUNT=+12025550123
+  SIGNAL_CLI_SERVICE_WAS_ACTIVE=true
+  timeout() {
+    : >"$work_dir/receive-invoked"
+    return 97
+  }
+
+  run_initial_receive >/dev/null
+  test ! -e "$work_dir/receive-invoked"
+' bash "$ROOT_DIR"
+
+expect_success "initial receive runs without payload output for fresh and relink setups" bash -c '
+  set -Eeuo pipefail
+  cd "$1"
+  source ./install.sh
+  work_dir="$(mktemp -d)"
+  trap '\''rm -rf "$work_dir"'\'' EXIT
+  TEST_MODE=false
+  DRY_RUN=false
+  SIGNAL_ACCOUNT=+12025550123
+  DATA_DIR="$work_dir/data directory"
+  LOCAL_BIN_DIR="$work_dir/bin"
+  timeout() {
+    printf "%s\n" "$@" >"$work_dir/receive-args"
+    printf "PRIVATE_MESSAGE_FIXTURE\n"
+    printf "receive diagnostic fixture\n" >&2
+  }
+  printf "%s\n" 30s runuser -u "$SERVICE_USER" -- env \
+    "HOME=$DATA_DIR" "XDG_DATA_HOME=$DATA_DIR" "$LOCAL_BIN_DIR/signal-cli" \
+    --data-dir "$DATA_DIR" -a "$SIGNAL_ACCOUNT" receive >"$work_dir/expected-args"
+
+  for scenario in fresh no-link-fresh relink; do
+    RUN_LINK=true
+    SIGNAL_CLI_SERVICE_WAS_ACTIVE=false
+    [[ "$scenario" != no-link-fresh ]] || RUN_LINK=false
+    [[ "$scenario" != relink ]] || SIGNAL_CLI_SERVICE_WAS_ACTIVE=true
+    rm -f "$work_dir/receive-args"
+
+    run_initial_receive >"$work_dir/stdout" 2>"$work_dir/stderr"
+    cmp "$work_dir/expected-args" "$work_dir/receive-args"
+    if grep -Fq "PRIVATE_MESSAGE_FIXTURE" "$work_dir/stdout"; then
+      exit 1
+    fi
+    grep -Fxq "receive diagnostic fixture" "$work_dir/stderr"
+  done
+' bash "$ROOT_DIR"
+
+expect_success "initial receive preserves diagnostics and remains best effort on failure" bash -c '
+  set -Eeuo pipefail
+  cd "$1"
+  source ./install.sh
+  work_dir="$(mktemp -d)"
+  trap '\''rm -rf "$work_dir"'\'' EXIT
+  TEST_MODE=false
+  DRY_RUN=false
+  RUN_LINK=true
+  SIGNAL_ACCOUNT=+12025550123
+  SIGNAL_CLI_SERVICE_WAS_ACTIVE=false
+  timeout() {
+    : >"$work_dir/receive-invoked"
+    printf "PRIVATE_MESSAGE_FIXTURE\n"
+    printf "receive failure fixture\n" >&2
+    return 17
+  }
+
+  run_initial_receive >"$work_dir/stdout" 2>"$work_dir/stderr"
+  test -f "$work_dir/receive-invoked"
+  if grep -Fq "PRIVATE_MESSAGE_FIXTURE" "$work_dir/stdout"; then
+    exit 1
+  fi
+  grep -Fxq "receive failure fixture" "$work_dir/stderr"
+' bash "$ROOT_DIR"
+
 expect_success "device linking aborts when the running service cannot stop" bash -c '
   set -Eeuo pipefail
   cd "$1"
@@ -3237,6 +3319,48 @@ expect_success "installed HTTP bind loader never evaluates config content" bash 
     exit 1
   fi
   test ! -e "$marker"
+' bash "$ROOT_DIR"
+
+expect_success "daemon wrapper suppresses received stdout and preserves runtime arguments" bash -c '
+  set -Eeuo pipefail
+  cd "$1"
+  work_dir="$(mktemp -d)"
+  INSTALL_ROOT="$work_dir"
+  source ./install.sh
+  trap '\''rm -rf "$work_dir"'\'' EXIT
+  DATA_DIR="$work_dir/data directory"
+  HTTP_BIND="[::1]:9876"
+  mkdir -p "$LOCAL_BIN_DIR" "$(dirname "$CONFIG_FILE")" "$(dirname "$WRAPPER_FILE")"
+  cat >"$LOCAL_BIN_DIR/signal-cli" <<'\''EOF'\''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf "%s\n" "$@" >"$WRAPPER_ARGS_FILE"
+silent=false
+for argument in "$@"; do
+  [[ "$argument" != --no-receive-stdout ]] || silent=true
+done
+if [[ "$silent" == false ]]; then
+  printf "PRIVATE_MESSAGE_FIXTURE\n"
+fi
+printf "daemon diagnostic fixture\n" >&2
+EOF
+  chmod +x "$LOCAL_BIN_DIR/signal-cli"
+  render_wrapper >"$WRAPPER_FILE"
+  export WRAPPER_ARGS_FILE="$work_dir/actual-args"
+
+  for SIGNAL_ACCOUNT in +12025550123 ""; do
+    render_runtime_config >"$CONFIG_FILE"
+    printf "%s\n" --data-dir "$DATA_DIR" >"$work_dir/expected-args"
+    if [[ -n "$SIGNAL_ACCOUNT" ]]; then
+      printf "%s\n" -a "$SIGNAL_ACCOUNT" >>"$work_dir/expected-args"
+    fi
+    printf "%s\n" daemon --no-receive-stdout --http "$HTTP_BIND" >>"$work_dir/expected-args"
+
+    bash "$WRAPPER_FILE" >"$work_dir/stdout" 2>"$work_dir/stderr"
+    cmp "$work_dir/expected-args" "$WRAPPER_ARGS_FILE"
+    test ! -s "$work_dir/stdout"
+    grep -Fxq "daemon diagnostic fixture" "$work_dir/stderr"
+  done
 ' bash "$ROOT_DIR"
 
 expect_success "systemd render keeps hardening directives" bash -c '

@@ -27,6 +27,7 @@ This installer is intentionally small, but it performs privileged actions. Revie
 - Weak SSH configuration can expose the VPS before or after installation.
 - Running an unreviewed modified installer as root can compromise the host.
 - Leaked `/var/lib/signal-cli` data can compromise the linked Signal device state.
+- Received message contents printed to stdout can be retained in installer logs or the service journal.
 
 ## Chosen Mitigations
 
@@ -35,6 +36,7 @@ This installer is intentionally small, but it performs privileged actions. Revie
 - Unverified release artifact installation requires `--verify none --allow-unverified-download`.
 - The service runs as an unprivileged `signal-cli` system user.
 - signal-cli data is stored under a `0700` data directory.
+- The daemon disables received-message stdout, and the initial receive pass discards stdout while preserving stderr diagnostics.
 - The systemd unit uses strict filesystem protection, no new privileges, no capabilities, private temporary storage, and a reduced syscall/address-family surface.
 - UFW denies inbound traffic by default while preserving detected SSH ports.
 - fail2ban is configured for SSH.

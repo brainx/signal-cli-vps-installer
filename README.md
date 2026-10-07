@@ -151,6 +151,8 @@ curl -sS -X POST http://127.0.0.1:8080/api/v1/rpc \
 
 Treat the JSON-RPC daemon as privileged automation infrastructure. It can send and receive Signal messages for the linked account.
 
+The generated daemon wrapper and initial receive pass suppress received-message stdout while preserving diagnostics. Existing installations need a `--no-link` reinstall to update the wrapper; see [service files](docs/operations.md#service-files).
+
 - Keep the default localhost bind unless you have a separate authenticated transport such as a VPN, SSH tunnel, or private reverse proxy.
 - Do not expose the signal-cli JSON-RPC port directly to the public internet.
 - Read `install.sh` before running it as root.

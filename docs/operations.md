@@ -71,6 +71,10 @@ The installer writes:
 
 The data directory contains linked-device state and should be treated as sensitive.
 
+The generated daemon wrapper uses `--no-receive-stdout` to keep received message contents out of service stdout. The initial receive pass also discards message stdout while retaining stderr diagnostics. During a `--no-link` reinstall with an active daemon, the installer skips that pass to avoid competing for the account lock.
+
+To apply these wrapper changes to an existing installation, rerun `install.sh` with `--no-link`, the same account, bind address, and hardening options, and a pinned version with its matching checksum. The binary-only upgrade script does not rewrite the wrapper.
+
 ## Health Check
 
 ```bash

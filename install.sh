@@ -2242,7 +2242,7 @@ if [[ -n "\${SIGNAL_CLI_ACCOUNT:-}" ]]; then
   args+=(-a "\$SIGNAL_CLI_ACCOUNT")
 fi
 
-exec "$LOCAL_BIN_DIR/signal-cli" "\${args[@]}" daemon --http "\$SIGNAL_CLI_HTTP_BIND"
+exec "$LOCAL_BIN_DIR/signal-cli" "\${args[@]}" daemon --no-receive-stdout --http "\$SIGNAL_CLI_HTTP_BIND"
 EOF
 }
 
@@ -2367,9 +2367,14 @@ run_initial_receive() {
     return 0
   fi
 
+  if is_true "$SIGNAL_CLI_SERVICE_WAS_ACTIVE" && ! is_true "$RUN_LINK"; then
+    log "Skipping initial receive; leaving receive handling to the existing daemon."
+    return 0
+  fi
+
   log "Running a short initial receive pass for contacts/groups sync."
   run_cmd timeout 30s runuser -u "$SERVICE_USER" -- env HOME="$DATA_DIR" XDG_DATA_HOME="$DATA_DIR" \
-    "$LOCAL_BIN_DIR/signal-cli" --data-dir "$DATA_DIR" -a "$SIGNAL_ACCOUNT" receive || true
+    "$LOCAL_BIN_DIR/signal-cli" --data-dir "$DATA_DIR" -a "$SIGNAL_ACCOUNT" receive >/dev/null || true
 }
 
 write_systemd_service() {
